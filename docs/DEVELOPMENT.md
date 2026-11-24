@@ -20,7 +20,8 @@ python -m unittest discover -s astrbot_plugin_daily_routine/tests -v
 
 ## 接口
 
-- `companion_snapshot(origin)`：当前会话、单一人格下各人的简短时段背景，无现行安排或人格不明时返回空对象。不通过 v1 自动注入链路重复完整画像、问候与好奇。
+- `companion_snapshot(origin)`：固定返回空对象，避免 v1 的自动前台注入绕过本插件控制。
+- `companion_memory(origin, persona=..., actor=...)`：版本 1 的本人直接形成记忆，不包含导入内容。actor 与自主认知的账号哈希规则一致。两边各自后台读取、缓存；不走前台钩子。
 - `companion_timing(origin, role=..., sender=..., persona=...)`：读取当前时机及 `initiative_factor`。群聊必须明确 sender 才提供个人触发系数。
 - `companion_allow_initiative(origin, role)`：仅供后台主动候选使用。不存在已知安排或双方未开启联动则允许，工作时减少、睡眠时暂停。
 - `companion_observe(packet)`：只接收其他插件已经发出的主动消息时间，不把它当成人的作息观察。
@@ -31,5 +32,7 @@ python -m unittest discover -s astrbot_plugin_daily_routine/tests -v
 ## 验证边界
 
 0.2.0 的专用场景验证在 `test_daily_memory.py`：无关任务不注入日常、相关召回、临时安排日期、事实补成区间、真实问答中的省略回答、旧语境不能成为新事实证据、可选好奇及间隔、WAIT、旧版数据读取。使用原有后台整理调用同时处理记忆与好奇，不另增前台模型调用。
+
+0.3.0 的七项反向审查回归在 `test_review_fixes.py`，双插件实际类验证在 `test_mutual_memory.py`。包括限期例外后恢复原班次、新答案不复提旧问、前台开关不被自动快照绕过、保存间隙收到消息不发送、独立 Provider 启动、双向学习、时间不刷新、账号与人格隔离、删除传播、重新加载、逐条清除指纹及不循环导出。
 
 自动测试覆盖后台调度、真实 SDK 的安装和钩子、持久化、夜班与日期例外、个体隔离、可选联动、情绪接口、问候 WAIT 与不连发。测试不证明任意模型能正确理解所有自然语言，也不替代真实平台上的主动发送验收。实际识别结果可用命令核对、修正和删除。

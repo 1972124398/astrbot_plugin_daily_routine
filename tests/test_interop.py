@@ -44,7 +44,7 @@ class Interop(unittest.IsolatedAsyncioTestCase):
             module, peer = self.install(role)
             self.plugin.link.connect()
             self.assertIn("daily_routine", module.NAMES)
-            self.assertIn("daily_routine", peer.link.context_for(event.unified_msg_origin))
+            self.assertNotIn("daily_routine", peer.link.context_for(event.unified_msg_origin))
             self.plugin.config["link_" + role] = False
             self.plugin.link.connect()
             self.assertNotIn("daily_routine", module.NAMES)

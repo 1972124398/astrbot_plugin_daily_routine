@@ -18,7 +18,7 @@ from astrbot.core.agent.message import TextPart
 from .interop import CompanionLink
 from .routine import (EXTRACT_SYSTEM, GREETING_SYSTEM, GUIDANCE, KINDS, LABELS, advice, apply_updates,
                       conversation_key, curiosity_due, human_event, minute, opportunities, parse_updates,
-                      profile_key, recall, relevance, social_opening, text)
+                      profile_key, recall, social_opening, text, actor_key, memory_rows)
 from .runtime import Runtime
 from .store import Store, empty_state, new_profile
 
@@ -41,10 +41,12 @@ class DailyRoutine(Star):
         self.save_wake, self.wake = asyncio.Event(), asyncio.Event()
         self.save_lock = asyncio.Lock()
         self.frontend = {}
+        self.front_origins = {}
         self.last_front = 0
         self.analysis_provider = ""
         self.chat_providers = {}
         self.last_error = ""
+        self.memory_sync_at = 0
 
     async def initialize(self):
         # Startup is the only read; every request thereafter uses memory.
@@ -117,7 +119,21 @@ class DailyRoutine(Star):
     def busy(self):
         now = time.monotonic()
         self.frontend = {key: until for key, until in self.frontend.items() if until > now}
+        self.front_origins = {key: origin for key, origin in self.front_origins.items() if key in self.frontend}
         return bool(self.frontend) or now - self.last_front < 3
+
+    async def independent_provider(self):
+        provider = str(self.config.get("analysis_provider_id", "") or "")
+        if not provider:
+            return False
+        for token in self.frontend:
+            origin = self.front_origins.get(token)
+            if not origin:
+                return False
+            self.chat_providers[origin] = await self.context.get_current_chat_provider_id(origin)
+            if self.chat_providers[origin] == provider:
+                return False
+        return True
 
     def selected(self, origin, persona=None, sender=None):
         return [p for p in self.state["profiles"].values()
@@ -139,6 +155,7 @@ class DailyRoutine(Star):
         mid = str(getattr(event.message_obj, "message_id", "") or uuid.uuid4().hex)
         event.set_extra(TURN, {"key": key, "generation": profile["generation"]})
         self.frontend[key + mid] = time.monotonic() + 300
+        self.front_origins[key + mid] = origin
         event.get_extra(TURN)["token"] = key + mid
         self.last_front = time.monotonic()
         self.link.begin(event)
@@ -161,13 +178,17 @@ class DailyRoutine(Star):
         if not self.config.get("context_enabled", True):
             return
         # Routine awareness stays in the background unless it helps this topic.
-        remembered = recall(profile, human, now, self.config)
+        remembered = recall(self.memory_profile(profile), human, now, self.config)
+        existing_text = "\n".join(str(getattr(p, "text", "")) for p in (request.extra_user_content_parts or []))
+        remembered = [line for line in remembered if line not in existing_text]
         lines = ["以前聊过，相关时参考：" + "；".join(remembered)[:700]] if remembered else []
         if previous_greeting:
             lines.append("上次主动说过，供接住这次回应：" + previous_greeting)
-        opening = new_session and social_opening(human)
+        opening = new_session and social_opening(human) and len(profile["pending"]) <= 1
         thought = curiosity_due(profile, now, self.config)
-        if thought and (opening or relevance(human, thought) >= 3):
+        # A related new statement may already answer the old question. Let the
+        # background understand it instead of re-offering that question now.
+        if thought and opening:
             lines.append("以前留下的一点好奇，话题合适且你此刻也想了解时再说：" + thought["text"])
             event.get_extra(TURN)["curiosity"] = thought["key"]
         ideas = (opportunities(profile, now, self.config)
@@ -191,6 +212,7 @@ class DailyRoutine(Star):
         if not turn or getattr(response, "tools_call_args", None):
             return
         self.frontend.pop(turn["token"], None)
+        self.front_origins.pop(turn["token"], None)
         self.last_front = time.monotonic()
         self.link.end(event)
         profile = self.state["profiles"].get(turn["key"])
@@ -215,6 +237,13 @@ class DailyRoutine(Star):
 
     async def process(self, key, profile):
         turns = copy.deepcopy(profile["pending"][:16])
+        shared = profile.get("shared_pending")
+        imported = [{"id": "cognition:" + str(r["key"]), "text": r["text"], "time": r["updated"],
+                     "memory_source": "self_cognition", "original_evidence": r.get("evidence", "")}
+                    for r in (shared or {}).get("records", [])]
+        sources = turns + imported
+        if not sources and shared is None:
+            return
         generation = profile["generation"]
         zone = ZoneInfo(profile.get("timezone") or self.config.get("timezone", "Asia/Shanghai"))
         provider = str(self.config.get("analysis_provider_id", "") or "")
@@ -230,22 +259,41 @@ class DailyRoutine(Star):
                 persona = text(current.get("prompt"), 12000)
         payload = {"person": profile["name"], "timezone": str(zone), "persona": persona,
                    "curiosity_enabled": self.config.get("curiosity_enabled", True),
-                   "turns": [{**t, "at": datetime.fromtimestamp(t["time"], zone).isoformat()} for t in turns],
+                   "turns": [{**t, "at": datetime.fromtimestamp(t["time"], zone).isoformat()} for t in sources],
                    "recent_dialogue": [{**t, "at": datetime.fromtimestamp(t["time"], zone).isoformat()}
-                                       for t in profile.get("recent", []) if 0 <= turns[0]["time"] - t["time"] < 86400],
+                                       for t in profile.get("recent", []) if 0 <= (turns[0]["time"] if turns else time.time()) - t["time"] < 86400],
                    "curiosity": profile.get("curiosity"),
-                   "known": {field: list(profile[field].values()) for field in ("routines", "facts")},
-                   "long_term_memory": self.link.snapshot("self_cognition", profile["origin"], persona=profile["persona"])}
+                   "known": {field: memory_rows(self.memory_profile(profile), field) for field in ("routines", "facts")},
+                   "long_term_memory": self.cognition_background(profile)}
         async with asyncio.timeout(float(self.config.get("analysis_timeout_seconds", 60))):
             response = await self.context.llm_generate(chat_provider_id=self.analysis_provider, system_prompt=EXTRACT_SYSTEM,
                                                        prompt=json.dumps(payload, ensure_ascii=False))
-        updates = parse_updates(response.completion_text, turns)
+        updates = parse_updates(response.completion_text, sources)
         if not self.config.get("curiosity_enabled", True):
             updates["curiosity"] = None
         if (self.state["profiles"].get(key) is not profile or profile["generation"] != generation
                 or profile["paused"] or not self.allowed(profile["origin"])):
             return
-        apply_updates(profile, updates, time.time())
+        native_ids = {t["id"] for t in turns}
+        native = {field: [r for r in updates[field] if r["source_id"] in native_ids] for field in ("routines", "facts", "remove")}
+        if "curiosity" in updates:
+            native["curiosity"] = updates["curiosity"]
+        apply_updates(profile, native, time.time())
+        if native.get("curiosity") and native["curiosity"]["source_id"] not in native_ids:
+            profile["curiosity"]["updated"] = next(t["time"] for t in imported if t["id"] == native["curiosity"]["source_id"])
+        if shared is not None and profile.get("shared_pending") is shared:
+            learned = {"routines": {}, "facts": {}, "exceptions": {}}
+            originals = {t["id"]: t for t in imported}
+            for field in ("routines", "facts"):
+                for row in updates[field]:
+                    original = originals.get(row["source_id"])
+                    if original:
+                        row = {**row, "learned_from": "self_cognition", "original_evidence": original["original_evidence"]}
+                        apply_updates(learned, {"routines": [row] if field == "routines" else [],
+                                               "facts": [row] if field == "facts" else [], "remove": []}, original["time"])
+            profile["learned"] = learned
+            profile["shared_revision"] = shared["revision"]
+            profile.pop("shared_pending", None)
         profile["recent"] = [*profile.get("recent", []), *turns][-6:]
         ids = {t["id"] for t in turns}
         profile["pending"] = [t for t in profile["pending"] if t["id"] not in ids]
@@ -258,19 +306,23 @@ class DailyRoutine(Star):
             self.wake.clear()
             self.link.connect()
             now = time.time()
-            if not self.busy():
+            if now >= self.memory_sync_at:
+                for profile in list(self.state["profiles"].values()):
+                    self.sync_memory(profile)
+                self.memory_sync_at = now + 30
+            if not self.busy() or await self.independent_provider():
                 for key, profile in list(self.state["profiles"].items()):
                     turns = profile["pending"]
-                    if not turns or profile["paused"] or not self.allowed(profile["origin"]) or now < profile["retry_at"]:
+                    if (not turns and "shared_pending" not in profile) or profile["paused"] or not self.allowed(profile["origin"]) or now < profile["retry_at"]:
                         continue
-                    if (now - turns[-1]["time"] < float(self.config.get("learn_idle_seconds", 45))
+                    if (turns and now - turns[-1]["time"] < float(self.config.get("learn_idle_seconds", 45))
                             and len(turns) < 6 and now - turns[0]["time"] < 600):
                         continue
                     try:
                         self.analysis_task = asyncio.create_task(self.process(key, profile))
                         await self.analysis_task
                     except asyncio.CancelledError:
-                        if self.closing:
+                        if self.closing or asyncio.current_task().cancelling():
                             raise
                     except Exception as error:
                         profile["failures"] += 1
@@ -287,21 +339,82 @@ class DailyRoutine(Star):
                 pass
 
     def companion_snapshot(self, origin=""):
-        if not origin or not self.allowed(origin) or not self.config.get("interop_enabled", True):
+        # V1 snapshots are auto-injected by peers on unrelated chat requests.
+        # Explicit background timing and memory interfaces own these data now.
+        return {}
+
+    def memory_profile(self, profile):
+        """Read-through learned records; native and imported origins stay separate."""
+        if not self.link.peer("self_cognition", profile["origin"]):
+            return profile
+        learned = profile.get("learned", {})
+        result = {**profile}
+        for field in ("routines", "facts", "exceptions"):
+            result[field] = dict(learned.get(field, {}))
+            for key, row in profile.get(field, {}).items():
+                if row.get("updated", 0) >= result[field].get(key, {}).get("updated", 0):
+                    result[field][key] = row
+        for key in set(result["routines"]) & set(result["facts"]):
+            older = "facts" if result["routines"][key].get("updated", 0) >= result["facts"][key].get("updated", 0) else "routines"
+            result[older].pop(key)
+        return result
+
+    def cognition_background(self, profile):
+        peer = self.link.peer("self_cognition", profile["origin"])
+        read = getattr(peer, "companion_memory", None)
+        if read:
+            return read(profile["origin"], persona=profile["persona"], actor=actor_key(profile["origin"], profile["sender"]))
+        if ":GroupMessage:" in profile["origin"]:
             return {}
-        profiles = self.selected(origin)
-        if not profiles or len({p["persona"] for p in profiles}) != 1:
+        return self.link.snapshot("self_cognition", profile["origin"], persona=profile["persona"])
+
+    def sync_memory(self, profile):
+        if profile["paused"] or not self.allowed(profile["origin"]):
+            return
+        peer = self.link.peer("self_cognition", profile["origin"])
+        read = getattr(peer, "companion_memory", None)
+        if not read:
+            return
+        try:
+            data = read(profile["origin"], persona=profile["persona"], actor=actor_key(profile["origin"], profile["sender"]))
+        except Exception:
+            return
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return
+        if (data.get("persona") != profile["persona"] or data.get("actor") != actor_key(profile["origin"], profile["sender"])
+                or data.get("origin") != conversation_key(profile["origin"])):
+            return
+        revision = hashlib.sha256(json.dumps(data.get("records", []), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        if revision == profile.get("shared_revision") or revision == profile.get("shared_pending", {}).get("revision"):
+            return
+        profile["shared_source"] = data.get("records", [])
+        blocked = set(profile.get("shared_blocked", []))
+        records = [row for row in data.get("records", []) if self.shared_fingerprint(row) not in blocked]
+        profile["learned"] = {}
+        if not records:
+            profile["learned"] = {}
+            profile["shared_revision"] = revision
+            profile.pop("shared_pending", None)
+        else:
+            profile["shared_pending"] = {"revision": revision, "records": records}
+        self.changed()
+
+    @staticmethod
+    def shared_fingerprint(row):
+        return hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def companion_memory(self, origin, *, persona, actor):
+        if not self.allowed(origin) or not self.link.peer("self_cognition", origin):
             return {}
-        now = time.time()
-        people = []
-        for profile in profiles[:8]:
-            timing = advice(profile, now, self.config)
-            if timing["current"]:
-                people.append({"name": profile["name"], "sender_id": profile["sender"],
-                               "current": timing["current"][:2], "initiative_factor": timing["initiative_factor"]})
-        # The v1 roster is also read during regular chat. Do not repeat questions
-        # or the complete portrait through that second injection path.
-        return {"guidance": "仅作主动联系时机参考，真人正在聊天时按当前话题交流。", "people": people} if people else {}
+        profiles = [p for p in self.selected(origin, persona) if actor_key(origin, p["sender"]) == actor]
+        if len(profiles) != 1:
+            return {}
+        profile = profiles[0]
+        records = [{**row, "key": field + ":" + row["key"] + ":" + row.get("date_from", "") + ":" + row.get("date_to", ""), "field": field}
+                   for field in ("routines", "facts") for row in memory_rows(profile, field)]
+        return {"version": 1, "origin": conversation_key(origin), "persona": persona, "actor": actor,
+                "context_enabled": self.config.get("context_enabled", True), "records": records,
+                "timezone": profile.get("timezone") or self.config.get("timezone", "Asia/Shanghai")}
 
     def companion_timing(self, origin, *, role="", sender="", persona=None):
         if not self.config.get("interop_enabled", True) or not self.allowed(origin):
@@ -312,7 +425,7 @@ class DailyRoutine(Star):
         if ":GroupMessage:" in origin and not sender:
             return {}
         profiles = self.selected(origin, persona, sender or None)
-        return advice(profiles[0], time.time(), self.config) if len(profiles) == 1 else {}
+        return advice(self.memory_profile(profiles[0]), time.time(), self.config) if len(profiles) == 1 else {}
 
     def companion_allow_initiative(self, origin, role):
         timing = self.companion_timing(origin, role=role)
@@ -341,19 +454,20 @@ class DailyRoutine(Star):
         origin, now = profile["origin"], time.time()
         if (not self.allowed(origin) or not self.config.get("proactive_enabled", False)
                 or origin not in self.config.get("proactive_origins", []) or ":FriendMessage:" not in origin
-                or profile["paused"] or not profile["contact"] or profile["pending"] or self.busy()):
+                or profile["paused"] or not profile["contact"] or profile["pending"] or "shared_pending" in profile or self.busy()):
             return
         if (not profile["last_human"] or now - profile["last_human"] > 7 * 86400
                 or now - profile["last_human"] < 300 or profile["last_outbound"] > profile["last_human"]
                 or now - profile["last_sent"] < float(self.config.get("greeting_gap_hours", 8)) * 3600
                 or now - profile["last_checked"] < 1800):
             return
-        ideas = opportunities(profile, now, self.config) if self.config.get("greeting_hints", True) else []
+        view_profile = self.memory_profile(profile)
+        ideas = opportunities(view_profile, now, self.config) if self.config.get("greeting_hints", True) else []
         thought = curiosity_due(profile, now, self.config)
         if thought:
             ideas = [{"id": "curiosity:" + thought["key"], "label": "可选的日常好奇", "context": thought["text"],
                       "reason": thought["reason"]}]
-        timing = advice(profile, now, self.config)
+        timing = advice(view_profile, now, self.config)
         if not ideas or not self.timing_choice(origin, "daily_routine", timing["initiative_factor"]):
             return
         if self.link.snapshot("play_together", origin).get("current_game") or self.link.snapshot("self_amusement", origin).get("wants_space"):
@@ -363,6 +477,8 @@ class DailyRoutine(Star):
         token = self.link.claim(float(self.config.get("interop_gap_minutes", 10)) * 60)
         if not token:
             return
+        reserved_outbound = previous_outbound = None
+        attempted = False
         try:
             profile["last_checked"] = now
             self.changed()
@@ -372,8 +488,8 @@ class DailyRoutine(Star):
                 if view.persona_id != profile["persona"]:
                     return
                 payload = {"opportunities": ideas, "routine": timing,
-                           "daily_memory": recall(profile, "我的日常", now, self.config),
-                           "long_term_memory": self.link.snapshot("self_cognition", origin, persona=profile["persona"]),
+                           "daily_memory": recall(view_profile, "我的日常", now, self.config),
+                           "long_term_memory": self.cognition_background(profile),
                            "mood": self.link.snapshot("short_term_mood", origin)}
                 line = await self.runtime.draft(view, GREETING_SYSTEM, payload)
             if (not self.link.current(token) or generation != profile["generation"] or not self.allowed(origin)
@@ -389,10 +505,17 @@ class DailyRoutine(Star):
             self.changed()
             if not line or line.upper() == "WAIT":
                 return
-            self.sending = True
             # Persist the attempt before sending; an unconfirmed send must not be retried in a loop.
-            profile["last_outbound"] = time.time()
+            previous_outbound = profile["last_outbound"]
+            reserved_outbound = profile["last_outbound"] = time.time()
             await self.persist()
+            if (not self.link.current(token) or generation != profile["generation"] or not self.allowed(origin)
+                    or not self.config.get("proactive_enabled", False) or not profile["contact"] or profile["paused"]
+                    or origin not in self.config.get("proactive_origins", []) or self.busy()
+                    or (thought and not self.config.get("curiosity_enabled", True))):
+                return
+            self.sending = True
+            attempted = True
             async with asyncio.timeout(30):
                 delivered = await self.runtime.send(view, line[:1000])
             if delivered:
@@ -401,6 +524,9 @@ class DailyRoutine(Star):
                 self.link.sent(origin, line[:1000], view.persona)
             self.changed()
         finally:
+            if not attempted and reserved_outbound is not None and profile["last_outbound"] == reserved_outbound:
+                profile["last_outbound"] = previous_outbound
+                self.changed()
             self.sending = False
             self.link.release(token)
 
@@ -426,10 +552,11 @@ class DailyRoutine(Star):
             return
         _, profile = await self.command_profile(event)
         lines = [f"{profile['name']}的日常画像（当前会话与人格）", "记录：" + ("暂停" if profile["paused"] else "开启")]
-        for row in profile["routines"].values():
+        view = self.memory_profile(profile)
+        for row in memory_rows(view, "routines"):
             suffix = "；截至" + row["date_to"] if row.get("date_to") else ""
             lines.append(f"[{row['key']}] {row['text']}（{row['start']}–{row['end']}{suffix}）")
-        lines.extend(f"[{r['key']}] {r['text']}" for r in profile["facts"].values())
+        lines.extend(f"[{r['key']}] {r['text']}" for r in memory_rows(view, "facts"))
         if profile.get("curiosity"):
             lines.append("可选好奇：" + profile["curiosity"]["text"])
         lines.append("待后台整理：" + str(len(profile["pending"])) + " 条")
@@ -477,6 +604,11 @@ class DailyRoutine(Star):
             return
         for field in ("routines", "facts"):
             profile[field].pop(key, None)
+        profile["exceptions"] = {slot: r for slot, r in profile.get("exceptions", {}).items() if r["key"] != key}
+        profile["learned"] = {}
+        profile["shared_blocked"] = list(set(profile.get("shared_blocked", [])) |
+                                          {self.shared_fingerprint(r) for r in profile.get("shared_source", [])})
+        profile.pop("shared_pending", None)
         profile["curiosity"] = None
         profile["recent"] = []
         profile["generation"] += 1
@@ -496,6 +628,8 @@ class DailyRoutine(Star):
             profile["generation"] += 1
             replacement = new_profile(profile["origin"], profile["persona"], profile["sender"], profile["name"])
             replacement.update(generation=profile["generation"], contact=profile["contact"])
+            replacement["shared_blocked"] = list(set(profile.get("shared_blocked", [])) |
+                                                  {self.shared_fingerprint(r) for r in profile.get("shared_source", [])})
             self.state["profiles"][key] = replacement
         else:
             yield event.plain_result("/routine_control pause 暂停；resume 恢复；clear 清空自己的当前会话人格画像。")

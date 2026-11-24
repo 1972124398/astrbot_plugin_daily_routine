@@ -30,6 +30,10 @@ def profile_key(origin, persona, sender):
     return hashlib.sha256(json.dumps([conversation_key(origin), persona, str(sender)], ensure_ascii=False).encode()).hexdigest()
 
 
+def actor_key(origin, sender):
+    return "user:" + hashlib.sha256(json.dumps([str(origin).split(":", 1)[0], str(sender)], ensure_ascii=False).encode()).hexdigest()[:24]
+
+
 def human_event(event):
     extra = event.get_extra
     envelope = extra("w1_event")
@@ -156,12 +160,20 @@ def parse_updates(raw, turns):
 
 
 def apply_updates(profile, updates, now):
+    exceptions = profile.setdefault("exceptions", {})
     for row in updates["remove"]:
         for field in ("routines", "facts"):
             profile[field].pop(row["key"], None)
+        for key in list(exceptions):
+            if exceptions[key]["key"] == row["key"]:
+                exceptions.pop(key)
     for field in ("routines", "facts"):
         for row in updates[field]:
             key = row["key"]
+            if row.get("date_from") or row.get("date_to"):
+                slot = field + ":" + key + ":" + row.get("date_from", "") + ":" + row.get("date_to", "")
+                exceptions[slot] = {**row, "field": field, "updated": now}
+                continue
             other = "facts" if field == "routines" else "routines"
             old = profile[field].get(key) or profile[other].get(key) or {}
             history = old.get("previous", [])
@@ -204,8 +216,23 @@ def relevance(query, row):
     return shared + categories * 3
 
 
+def personal_topic(query):
+    """Explicit personal recall remains available even inside a work request."""
+    if re.search(r"根据我|按我|我的作息|我的日常|我的习惯|记得我", query):
+        return True
+    return not (re.search(r"帮|请|给我|写一|生成|分析|解释|修复|翻译|总结|设计|编写|科普", query)
+                and re.search(r"代码|程序|制度|文案|报告|工作流|函数|算法|作文|论文|科普|模板|总结|管理办法", query))
+
+
+def memory_rows(profile, field):
+    return [*profile.get(field, {}).values(),
+            *(r for r in profile.get("exceptions", {}).values() if r.get("field") == field)]
+
+
 def recall(profile, query, now, config, limit=3):
     """Recall relevant facts, keeping expired plans out of present-day context."""
+    if not personal_topic(query):
+        return []
     local_day = datetime.fromtimestamp(now, ZoneInfo(profile.get("timezone") or config.get("timezone", "Asia/Shanghai"))).date()
     offset = next((offset for word, offset in (("后天", 2), ("明天", 1), ("昨天", -1), ("前天", -2)) if word in query), 0)
     day = (local_day + timedelta(days=offset)).isoformat()
@@ -213,7 +240,10 @@ def recall(profile, query, now, config, limit=3):
     broad = bool(re.search(r"我的作息|我的日常|我的习惯|记得.*作息", query))
     candidates = []
     for field in ("routines", "facts"):
-        for row in profile[field].values():
+        rows = memory_rows(profile, field)
+        if field == "routines" and not historical:
+            rows = effective_records(rows, datetime.combine(local_day + timedelta(days=offset), datetime.min.time(), ZoneInfo(profile.get("timezone") or config.get("timezone", "Asia/Shanghai"))), config.get("china_calendar", True))
+        for row in rows:
             current = not ((row.get("date_to") and row["date_to"] < day) or (row.get("date_from") and row["date_from"] > day))
             score = relevance(query, row)
             if not (score or broad) or (not current and not historical):
@@ -246,8 +276,19 @@ def social_opening(query):
 
 
 def available_records(profile, now, stale_days):
-    return [r for r in profile["routines"].values()
+    return [r for r in memory_rows(profile, "routines")
             if now - r.get("updated", now) < stale_days * 86400]
+
+
+def effective_records(records, moment, china):
+    """Dated shifts replace their own kind for the day, not unrelated sleep."""
+    base = [r for r in records if not (r.get("date_from") or r.get("date_to"))]
+    dated = [r for r in records if (r.get("date_from") or r.get("date_to"))
+             and not any(b.get("kind") == r.get("kind") and b.get("updated", 0) > r.get("updated", 0) for b in base)
+             and (valid_on(r, moment.date(), china) or active(r, moment, china))]
+    return [*dated, *(r for r in base if not any(
+        (r.get("kind") == d.get("kind") or (d.get("kind") == "free" and active(d, moment, china) and r.get("kind") in {"work", "busy"}))
+        for d in dated))]
 
 
 def advice(profile, now, config):
@@ -255,11 +296,7 @@ def advice(profile, now, config):
     moment = datetime.fromtimestamp(now, ZoneInfo(zone))
     china = config.get("china_calendar", True)
     records = available_records(profile, now, float(config.get("stale_days", 120)))
-    current = [r for r in records if active(r, moment, china)]
-    # A dated exception takes precedence over the normal schedule for that day.
-    dated = [r for r in current if r.get("date_from") or r.get("date_to")]
-    if dated:
-        current = dated
+    current = [r for r in effective_records(records, moment, china) if active(r, moment, china)]
     factor = 1.0
     for row in current:
         factor = min(factor, {"sleep": 0.0, "work": 0.15, "busy": 0.1, "commute": 0.4, "meal": 0.6}.get(row["kind"], 1.0))
@@ -328,6 +365,7 @@ def opportunities(profile, now, config):
 
 EXTRACT_SYSTEM = """你在后台整理某一位真人的日常长期记忆，并按 persona 的实际人格决定有无一点自然的好奇，不参与当前聊天。
 known 是已有画像，long_term_memory 是可选旧记忆背景。recent_dialogue 和 turns 中 reply/preceding_reply 只是语境，不能当真人新事实。
+turns 中 memory_source=self_cognition 的条目是长期记忆插件直接形成的本人记忆，允许整理其中的日常，但必须保留原日期、用该条 source_id/id 为依据。它不是新的真人发言，不代表此刻活动或新确认；没有明确新变化时保留原有记录 key。
 只从 turns 中这个人的 text 提取新事实；可结合前面的实际问答理解省略回答。例如刚问几点下班，对方说“六点左右”，可以记通常六点下班，不能编上班时间。
 关注上下班、上课、通勤、吃饭、睡醒、夜班、空闲、平时活动、生活偏好与固定习惯，以及明确的临时安排。无需评价性格、情绪或关系。
 不能从消息发送时间推断起床/上下班；不能把 AI 的猜测、他人的安排、玩笑假设记成这个人的作息。

@@ -109,7 +109,7 @@ class DailyMemory(unittest.IsolatedAsyncioTestCase):
         _, request = await self.prepare("帮我修 Python 报错")
         self.assertEqual(request.extra_user_content_parts, [])
         event, request = await self.prepare("最近加班实在太多了")
-        self.assertIn("一点好奇", request.extra_user_content_parts[0].text)
+        self.assertFalse(any("一点好奇" in p.text for p in request.extra_user_content_parts))
         self.assertEqual(request.system_prompt, "原来的人格")
         await self.finish(event)
         _, again = await self.prepare("下班了")
@@ -131,6 +131,7 @@ class DailyMemory(unittest.IsolatedAsyncioTestCase):
         _, request = await self.prepare("早安", morning)
         self.assertEqual(request.extra_user_content_parts, [])
         self.p["last_human"] = morning - 3600
+        self.p["pending"] = []
         _, request = await self.prepare("早安", morning)
         self.assertIn("早间问候", request.extra_user_content_parts[0].text)
 
@@ -212,7 +213,7 @@ class DailyMemory(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.companion_snapshot(self.event.unified_msg_origin), {})
         self.p["routines"]["work"] = record(start="00:00", end="00:00", updated=time.time())
         value = str(self.plugin.companion_snapshot(self.event.unified_msg_origin))
-        self.assertIn("initiative_factor", value)
+        self.assertEqual(value, "{}")
         self.assertNotIn("无糖茶", value)
         self.assertNotIn("curiosity", value)
 
