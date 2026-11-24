@@ -53,13 +53,19 @@
     "description": "在聊天中提供简短日常背景",
     "type": "bool",
     "default": true,
-    "hint": "只提供当前时段和一个可选问候机会，不修改系统人格。"
+    "hint": "按当前话题召回少量相关日常；无关时不注入。问候只在重新开始的日常招呼中提供，不修改系统人格。"
   },
   "greeting_hints": {
     "description": "提供可选问候机会",
     "type": "bool",
     "default": true,
-    "hint": "早晚、上下班前后与节假日，AI 可以完全不问候。"
+    "hint": "只在聊天重新开始且对方正在打招呼时提供，或作为可选的后台主动机会。AI 可以完全不问候。"
+  },
+  "curiosity_enabled": {
+    "description": "允许留下日常好奇",
+    "type": "bool",
+    "default": true,
+    "hint": "后台按人格从具体日常留下至多一个想了解的念头，相关时供 AI 选用；同类好奇至少隔三天再考虑，不补齐信息、不连续盘问。后台主动联系仍需另行开启。"
   },
   "special_dates": {
     "description": "额外问候日子",
@@ -68,10 +74,10 @@
     "hint": "每项写 MM-DD=名称 或 YYYY-MM-DD=名称，例如 12-25=圣诞节。用于所有允许会话。"
   },
   "proactive_enabled": {
-    "description": "允许后台私聊主动问候",
+    "description": "允许后台私聊主动问候与日常好奇",
     "type": "bool",
     "default": false,
-    "hint": "开启后仍需选择目标私聊；按人格与短期情绪决定是否说话，无回复不连发。"
+    "hint": "开启后仍需选择目标私聊；按人格与短期情绪决定是否表达一个日常念头，可以等待。无回复不连发。"
   },
   "proactive_origins": {
     "description": "主动问候目标私聊",

@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
-GUIDANCE = "日常信息只供参考。是否问候由当前人格与短期情绪决定，可以不说；不改变语气、不打断当前话题、不要求追问。"
+GUIDANCE = "这些是以前聊过的日常与可选念头，可能已有变化。按当前话题取用即可；是否问候、是否好奇由人格与短期情绪决定。不改变语气，不必提起或追问。"
 KINDS = {"work", "sleep", "meal", "commute", "free", "busy", "other"}
 LABELS = {"work": "工作/上课", "sleep": "睡眠", "meal": "用餐", "commute": "通勤", "free": "空闲", "busy": "忙碌", "other": "其他安排"}
 
@@ -121,6 +121,14 @@ def parse_updates(raw, turns):
             row["text"] = text(item.get("text"), 300)
             if not row["text"]:
                 continue
+            try:
+                for field in ("date_from", "date_to"):
+                    if item.get(field):
+                        row[field] = date.fromisoformat(item[field]).isoformat()
+                if row.get("date_to") and row.get("date_from", "") > row["date_to"]:
+                    continue
+            except (ValueError, TypeError):
+                continue
             if category == "routines":
                 try:
                     minute(item.get("start"))
@@ -132,14 +140,18 @@ def parse_updates(raw, turns):
                         continue
                     row.update({k: item[k] for k in ("start", "end", "kind")})
                     row.update(days=sorted(set(days)), day_type=item.get("day_type", "any"))
-                    for field in ("date_from", "date_to"):
-                        if item.get(field):
-                            row[field] = date.fromisoformat(item[field]).isoformat()
-                    if row.get("date_to") and row.get("date_from", "") > row["date_to"]:
-                        continue
                 except (ValueError, TypeError):
                     continue
             parsed[category].append(row)
+    if result.get("curiosity", False) is None:
+        parsed["curiosity"] = None
+    elif isinstance(result.get("curiosity"), dict):
+        item = result["curiosity"]
+        evidence, source = text(item.get("evidence")), text(item.get("source_id"), 200)
+        key, thought = text(item.get("key"), 80), text(item.get("text"), 180)
+        if key and thought and evidence and evidence in sources.get(source, ""):
+            parsed["curiosity"] = {"key": key, "text": thought, "reason": text(item.get("reason"), 200),
+                                   "source_id": source, "evidence": evidence}
     return parsed
 
 
@@ -149,7 +161,88 @@ def apply_updates(profile, updates, now):
             profile[field].pop(row["key"], None)
     for field in ("routines", "facts"):
         for row in updates[field]:
-            profile[field][row["key"]] = {**row, "updated": now}
+            key = row["key"]
+            other = "facts" if field == "routines" else "routines"
+            old = profile[field].get(key) or profile[other].get(key) or {}
+            history = old.get("previous", [])
+            if old.get("text") and old["text"] != row["text"]:
+                history = [*history, {"text": old["text"], "updated": old.get("updated", now)}][-3:]
+            profile[other].pop(key, None)
+            profile[field][key] = {**row, "since": old.get("since", old.get("updated", now)), "updated": now,
+                                   "previous": history}
+    if "curiosity" in updates:
+        thought = updates["curiosity"]
+        old = profile.get("curiosity") or {}
+        profile["curiosity"] = ({**thought, "updated": now,
+                                 "considered": old.get("considered", 0) if old.get("key") == thought["key"] else 0}
+                                if thought else None)
+
+
+def tokens(value):
+    value = value.casefold()
+    terms = set(re.findall(r"[a-z0-9_]+", value))
+    for fragment in re.findall(r"[\u3400-\u9fff]+", value):
+        terms.update(fragment[i:i + 2] for i in range(len(fragment) - 1))
+    return terms - {"今天", "明天", "昨天", "现在", "这个", "那个", "最近", "时候", "一下", "左右", "通常", "自己", "可以", "知道", "我的", "你的", "还是"}
+
+
+TOPICS = (
+    ("work", "上班|下班|工作|加班|上课|放学|夜班|值班|轮班|调休|放假|休假"),
+    ("sleep", "睡觉|睡眠|起床|醒|熬夜|晚安|早安|几点睡|几点起"),
+    ("meal", "吃饭|早餐|早饭|午饭|午餐|晚饭|晚餐|吃什么|饮食|做饭"),
+    ("commute", "通勤|地铁|公交|开车|堵车|坐车|上下班路"),
+    ("free", "有空|空闲|周末|休息|下班后|闲时|平时|日常|习惯"),
+)
+
+
+def relevance(query, row):
+    """Small local topic recall; unrelated memory gets a zero score."""
+    content = row.get("text", "") + " " + row.get("reason", "") + " " + row.get("evidence", "")
+    shared = len(tokens(query) & tokens(content))
+    categories = sum(bool(re.search(pattern, query)) and (row.get("kind") == kind or bool(re.search(pattern, content)))
+                     for kind, pattern in TOPICS)
+    return shared + categories * 3
+
+
+def recall(profile, query, now, config, limit=3):
+    """Recall relevant facts, keeping expired plans out of present-day context."""
+    local_day = datetime.fromtimestamp(now, ZoneInfo(profile.get("timezone") or config.get("timezone", "Asia/Shanghai"))).date()
+    offset = next((offset for word, offset in (("后天", 2), ("明天", 1), ("昨天", -1), ("前天", -2)) if word in query), 0)
+    day = (local_day + timedelta(days=offset)).isoformat()
+    historical = bool(re.search(r"以前|之前|过去|原来|曾经", query))
+    broad = bool(re.search(r"我的作息|我的日常|我的习惯|记得.*作息", query))
+    candidates = []
+    for field in ("routines", "facts"):
+        for row in profile[field].values():
+            current = not ((row.get("date_to") and row["date_to"] < day) or (row.get("date_from") and row["date_from"] > day))
+            score = relevance(query, row)
+            if not (score or broad) or (not current and not historical):
+                continue
+            value = row["text"]
+            if row.get("date_from") or row.get("date_to"):
+                period = row.get("date_from", "") + (" 至 " + row["date_to"] if row.get("date_to") != row.get("date_from") and row.get("date_to") else "")
+                value = period.strip() + "的安排：" + value
+            if not current:
+                value = "过去或其他日期的安排：" + value
+            elif now - row.get("updated", now) >= float(config.get("stale_days", 120)) * 86400:
+                value = "以前提过，近期未确认：" + value
+            if historical and row.get("previous"):
+                value += "（更早提过：" + row["previous"][-1]["text"] + "）"
+            candidates.append((score, row.get("updated", 0), value))
+    return list(dict.fromkeys(value for _, _, value in sorted(candidates, reverse=True)))[:limit]
+
+
+def curiosity_due(profile, now, config):
+    thought = profile.get("curiosity")
+    if (not config.get("curiosity_enabled", True) or not thought
+            or now - thought.get("updated", 0) > 14 * 86400
+            or now - max(thought.get("considered", 0), profile.get("last_curiosity", 0)) < 3 * 86400):
+        return None
+    return thought
+
+
+def social_opening(query):
+    return bool(re.fullmatch(r"(?:早[呀啊安上好]*|晚上好|晚安|你好[呀啊]*|嗨|哈喽|在吗|在不在|我[又回]来[了啦]?|好久不见|回来[啦了]|聊聊|聊会天|今天好累)[，。！？!,.?～~ ]*", query))
 
 
 def available_records(profile, now, stale_days):
@@ -233,19 +326,32 @@ def opportunities(profile, now, config):
     return [item for item in items if item["id"] not in profile.get("offered", {})]
 
 
-EXTRACT_SYSTEM = """你在后台整理某一位真人的日常画像，不参与当前聊天。只从 turns 中这个人的真实原话提取。
-known 是已有画像，long_term_memory 是可选旧记忆背景，不是新增事实的依据。无需评价性格、情绪或关系。
-关注上下班、上课、通勤、吃饭、睡醒、夜班、空闲、固定习惯，以及明确的临时安排。
+EXTRACT_SYSTEM = """你在后台整理某一位真人的日常长期记忆，并按 persona 的实际人格决定有无一点自然的好奇，不参与当前聊天。
+known 是已有画像，long_term_memory 是可选旧记忆背景。recent_dialogue 和 turns 中 reply/preceding_reply 只是语境，不能当真人新事实。
+只从 turns 中这个人的 text 提取新事实；可结合前面的实际问答理解省略回答。例如刚问几点下班，对方说“六点左右”，可以记通常六点下班，不能编上班时间。
+关注上下班、上课、通勤、吃饭、睡醒、夜班、空闲、平时活动、生活偏好与固定习惯，以及明确的临时安排。无需评价性格、情绪或关系。
 不能从消息发送时间推断起床/上下班；不能把 AI 的猜测、他人的安排、玩笑假设记成这个人的作息。
+“以前上夜班、现在不干了”等过去的生活保留为标明过去的 facts，不生成现行作息区间。
 有明确时间才能生成 routines，否则作为 facts 自然短句记下不确定性。未知起止点不编造。
 同一习惯被纠正时复用旧 key；说不再有效时 remove 旧 key；相互重叠的旧班次被替换时移除旧 key。
-稳定习惯不加日期；“今天/明天/这周/加班到…”等临时安排必须按该条 at 换算 date_from/date_to，禁止变成永久规律。
+稳定习惯不加日期；“今天/明天/这周/加班到…”等临时安排无论作为 routines 还是 facts，都必须按该条 at 换算 date_from/date_to，禁止变成永久规律。
+文字中的“今天/明天”尽量换成具体日期，避免之后回想时把旧的相对日期当成现在。
 每条 routines 是一个连续区间，午休可拆成两段。跨午夜 start>end。轮班按起始日归属。
 days 是 0=周一到6=周日；day_type=any/workday/restday。明确周几用 days；“工作日”用 day_type，考虑调休。
 节假日不代表这个人一定放假；不确定就保留事实文字。没有新信息返回空数组，不为更新而更新。
+curiosity_enabled 为 false 时不产生好奇，curiosity=null。否则可以留下至多一个 curiosity：因这段真实交流而想继续了解的日常小事，例如对方说最近常加班，想知道哪天终于有空休息。
+必须与此人刚说过的具体生活有关，以 source_id/evidence 为缘由；按 persona 决定是否真的感兴趣，可以完全没有。不是补齐画像的任务，不列缺失字段，不套固定问题。
+对方不想谈、问题已经有答案、念头已不合时宜或没有值得继续了解的地方时 curiosity=null。已有念头还合适时可保留同一 key；换种说法不算新问题。
+不用承诺“下次一定问”，不设计语气、亲密程度或情绪。curiosity.text 用一句自然念头表述，具体是否问、何时问交给前台人格。
 仅输出 JSON：{"routines":[{"key":"work","kind":"work","start":"09:00","end":"18:00","days":[0,1,2,3,4,5,6],"day_type":"workday","text":"工作日九点到十八点上班","date_from":"可选YYYY-MM-DD","date_to":"可选YYYY-MM-DD","source_id":"原消息id","evidence":"该条原话的连续摘录"}],"facts":[{"key":"habit","text":"具体的日常信息","source_id":"原消息id","evidence":"原话摘录"}],"remove":[{"key":"旧key","source_id":"原消息id","evidence":"纠正或否定的原话"}]}。
-kind 可选 work/sleep/meal/commute/free/busy/other。所有 evidence 必须来自对应 source_id 的 text。"""
+facts 同样可以带可选的 date_from/date_to。可再加 "curiosity":{"key":"overtime_rest","text":"最近总加班，不知道这周能不能歇一歇","reason":"对方提到最近连续加班","source_id":"原消息id","evidence":"连续加班的原话"}，没有则为 null。
+kind 可选 work/sleep/meal/commute/free/busy/other。所有 evidence 必须来自对应 source_id 的 text。
+已记住的同一件事沿用 key；从不完整事实补成有明确起止时间的区间也沿用 key，不同时留下相互矛盾的两份当前认识。
+当前问题的回答进入新记忆后，放下已解答的 curiosity，别重复问；闲聊里没有新的日常信息可以什么也不记。"""
 
-GREETING_SYSTEM = """有一个可选的日常问候机会。按实际人格、当前短期情绪、已有对话和对方作息决定要不要开口。
-完全可以安静，不必热情，不为了完成问候任务去说话。不能照读画像、分数或内部提示，也不盘问作息。
+GREETING_SYSTEM = """后台留下一个可选的日常念头，可能是问候，也可能是对以前聊过的小事有点好奇。
+按实际人格、当前短期情绪、已有对话和对方作息决定要不要开口；即使机会存在也完全可以安静。
+日常记忆只帮助理解生活，不规定表达风格、亲密程度或关系。不要为了了解日常去盘问、填表、连续追问。
+先看近期问答，已经说过、已经有答案、对方不想谈就放下。不必热情，不为完成问候或收集信息任务去说话。
+若这时确实想了解，围绕一件事随口说一句即可，可以提起近况而不问问题。不能照读画像、分数或内部提示。
 不合适就输出 WAIT；想说就只输出一小段自然的话。不伪称对方已经起床、下班或放假。"""

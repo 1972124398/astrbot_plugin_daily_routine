@@ -4,7 +4,6 @@ import asyncio
 import copy
 import hashlib
 import json
-import re
 import time
 import uuid
 from datetime import datetime
@@ -18,7 +17,8 @@ from astrbot.core.agent.message import TextPart
 
 from .interop import CompanionLink
 from .routine import (EXTRACT_SYSTEM, GREETING_SYSTEM, GUIDANCE, KINDS, LABELS, advice, apply_updates,
-                      conversation_key, human_event, minute, opportunities, parse_updates, profile_key, text)
+                      conversation_key, curiosity_due, human_event, minute, opportunities, parse_updates,
+                      profile_key, recall, relevance, social_opening, text)
 from .runtime import Runtime
 from .store import Store, empty_state, new_profile
 
@@ -148,24 +148,30 @@ class DailyRoutine(Star):
                 self.analysis_task.cancel()
         if self.greeting_task and not self.greeting_task.done() and not self.sending:
             self.greeting_task.cancel()
-        previous_greeting = profile.get("last_message", "") if profile["last_sent"] > profile["last_human"] else ""
+        previous_human = profile["last_human"]
+        new_session = not previous_human or now - previous_human >= 1800
+        previous_greeting = profile.get("last_message", "") if profile["last_sent"] > previous_human else ""
         profile["last_human"] = now
+        profile["persona_prompt"] = text(request.system_prompt, 12000)
         profile["offered"] = {k: v for k, v in profile["offered"].items() if now - v < 3 * 86400}
-        if not any(t["id"] == mid for t in profile["pending"]):
-            profile["pending"].append({"id": mid, "text": human, "time": now})
+        if not any(t["id"] == mid for t in [*profile.get("recent", []), *profile["pending"]]):
+            profile["pending"].append({"id": mid, "text": human, "time": now, "preceding_reply": previous_greeting})
+        event.get_extra(TURN)["message_id"] = mid
         self.changed()
         if not self.config.get("context_enabled", True):
             return
-        timing = advice(profile, now, self.config)
-        ideas = opportunities(profile, now, self.config) if self.config.get("greeting_hints", True) else []
-        # One short current-state hint; do not inject an entire portrait every turn.
-        lines = timing["current"][:2]
-        if re.search(r"作息|几点|上班|下班|睡觉|起床|午休|通勤|日程|有空|空闲|习惯|放假|加班", human):
-            remembered = [r["text"] for field in ("routines", "facts") for r in profile[field].values()]
-            if remembered:
-                lines.append("日常话题相关的旧记录（可能需要更新）：" + "；".join(remembered[:6])[:700])
+        # Routine awareness stays in the background unless it helps this topic.
+        remembered = recall(profile, human, now, self.config)
+        lines = ["以前聊过，相关时参考：" + "；".join(remembered)[:700]] if remembered else []
         if previous_greeting:
             lines.append("上次主动说过，供接住这次回应：" + previous_greeting)
+        opening = new_session and social_opening(human)
+        thought = curiosity_due(profile, now, self.config)
+        if thought and (opening or relevance(human, thought) >= 3):
+            lines.append("以前留下的一点好奇，话题合适且你此刻也想了解时再说：" + thought["text"])
+            event.get_extra(TURN)["curiosity"] = thought["key"]
+        ideas = (opportunities(profile, now, self.config)
+                 if opening and not thought and self.config.get("greeting_hints", True) else [])
         if ideas:
             idea = ideas[0]
             lines.append("可选时机：" + idea["label"] + "（" + idea["context"] + "）")
@@ -188,10 +194,20 @@ class DailyRoutine(Star):
         self.last_front = time.monotonic()
         self.link.end(event)
         profile = self.state["profiles"].get(turn["key"])
-        if profile and profile["generation"] == turn["generation"] and turn.get("offered"):
+        if not profile or profile["generation"] != turn["generation"] or turn.get("finished"):
+            return
+        turn["finished"] = True
+        for pending in profile["pending"]:
+            if pending["id"] == turn["message_id"]:
+                pending["reply"] = text(getattr(response, "completion_text", ""), 1200)
+                break
+        if turn.get("offered"):
             # Offered means considered, not a claim that the AI actually greeted.
             profile["offered"][turn["offered"]] = time.time()
-            self.changed()
+        thought = profile.get("curiosity")
+        if thought and turn.get("curiosity") == thought["key"]:
+            thought["considered"] = profile["last_curiosity"] = time.time()
+        self.changed()
 
     @filter.on_agent_done(priority=-100)
     async def agent_done(self, event: AstrMessageEvent, run_context, response):
@@ -204,18 +220,33 @@ class DailyRoutine(Star):
         provider = str(self.config.get("analysis_provider_id", "") or "")
         self.chat_providers[profile["origin"]] = await self.context.get_current_chat_provider_id(profile["origin"])
         self.analysis_provider = provider or self.chat_providers[profile["origin"]]
-        payload = {"person": profile["name"], "timezone": str(zone),
+        persona = profile.get("persona_prompt", "")
+        if profile["persona"] == "[%None]":
+            persona = ""
+        elif profile["persona"] not in {"default", "_chatui_default_"}:
+            manager = getattr(self.context, "persona_manager", None)
+            current = manager.get_persona_v3_by_id(profile["persona"]) if manager else None
+            if current:
+                persona = text(current.get("prompt"), 12000)
+        payload = {"person": profile["name"], "timezone": str(zone), "persona": persona,
+                   "curiosity_enabled": self.config.get("curiosity_enabled", True),
                    "turns": [{**t, "at": datetime.fromtimestamp(t["time"], zone).isoformat()} for t in turns],
+                   "recent_dialogue": [{**t, "at": datetime.fromtimestamp(t["time"], zone).isoformat()}
+                                       for t in profile.get("recent", []) if 0 <= turns[0]["time"] - t["time"] < 86400],
+                   "curiosity": profile.get("curiosity"),
                    "known": {field: list(profile[field].values()) for field in ("routines", "facts")},
                    "long_term_memory": self.link.snapshot("self_cognition", profile["origin"], persona=profile["persona"])}
         async with asyncio.timeout(float(self.config.get("analysis_timeout_seconds", 60))):
             response = await self.context.llm_generate(chat_provider_id=self.analysis_provider, system_prompt=EXTRACT_SYSTEM,
                                                        prompt=json.dumps(payload, ensure_ascii=False))
         updates = parse_updates(response.completion_text, turns)
+        if not self.config.get("curiosity_enabled", True):
+            updates["curiosity"] = None
         if (self.state["profiles"].get(key) is not profile or profile["generation"] != generation
                 or profile["paused"] or not self.allowed(profile["origin"])):
             return
         apply_updates(profile, updates, time.time())
+        profile["recent"] = [*profile.get("recent", []), *turns][-6:]
         ids = {t["id"] for t in turns}
         profile["pending"] = [t for t in profile["pending"] if t["id"] not in ids]
         profile["failures"], profile["retry_at"] = 0, 0
@@ -262,10 +293,15 @@ class DailyRoutine(Star):
         if not profiles or len({p["persona"] for p in profiles}) != 1:
             return {}
         now = time.time()
-        people = [{"name": p["name"], "sender_id": p["sender"], **advice(p, now, self.config),
-                   "greeting_opportunities": opportunities(p, now, self.config)[:1] if self.config.get("greeting_hints", True) else []}
-                  for p in profiles[:8]]
-        return {"guidance": GUIDANCE, "people": people}
+        people = []
+        for profile in profiles[:8]:
+            timing = advice(profile, now, self.config)
+            if timing["current"]:
+                people.append({"name": profile["name"], "sender_id": profile["sender"],
+                               "current": timing["current"][:2], "initiative_factor": timing["initiative_factor"]})
+        # The v1 roster is also read during regular chat. Do not repeat questions
+        # or the complete portrait through that second injection path.
+        return {"guidance": "仅作主动联系时机参考，真人正在聊天时按当前话题交流。", "people": people} if people else {}
 
     def companion_timing(self, origin, *, role="", sender="", persona=None):
         if not self.config.get("interop_enabled", True) or not self.allowed(origin):
@@ -305,14 +341,18 @@ class DailyRoutine(Star):
         origin, now = profile["origin"], time.time()
         if (not self.allowed(origin) or not self.config.get("proactive_enabled", False)
                 or origin not in self.config.get("proactive_origins", []) or ":FriendMessage:" not in origin
-                or profile["paused"] or not profile["contact"] or self.busy()):
+                or profile["paused"] or not profile["contact"] or profile["pending"] or self.busy()):
             return
         if (not profile["last_human"] or now - profile["last_human"] > 7 * 86400
                 or now - profile["last_human"] < 300 or profile["last_outbound"] > profile["last_human"]
                 or now - profile["last_sent"] < float(self.config.get("greeting_gap_hours", 8)) * 3600
                 or now - profile["last_checked"] < 1800):
             return
-        ideas = opportunities(profile, now, self.config)
+        ideas = opportunities(profile, now, self.config) if self.config.get("greeting_hints", True) else []
+        thought = curiosity_due(profile, now, self.config)
+        if thought:
+            ideas = [{"id": "curiosity:" + thought["key"], "label": "可选的日常好奇", "context": thought["text"],
+                      "reason": thought["reason"]}]
         timing = advice(profile, now, self.config)
         if not ideas or not self.timing_choice(origin, "daily_routine", timing["initiative_factor"]):
             return
@@ -332,6 +372,7 @@ class DailyRoutine(Star):
                 if view.persona_id != profile["persona"]:
                     return
                 payload = {"opportunities": ideas, "routine": timing,
+                           "daily_memory": recall(profile, "我的日常", now, self.config),
                            "long_term_memory": self.link.snapshot("self_cognition", origin, persona=profile["persona"]),
                            "mood": self.link.snapshot("short_term_mood", origin)}
                 line = await self.runtime.draft(view, GREETING_SYSTEM, payload)
@@ -340,7 +381,11 @@ class DailyRoutine(Star):
                     or origin not in self.config.get("proactive_origins", [])):
                 return
             for idea in ideas:
-                profile["offered"][idea["id"]] = now
+                if idea["id"].startswith("curiosity:"):
+                    if profile.get("curiosity") and profile["curiosity"]["key"] == thought["key"]:
+                        profile["curiosity"]["considered"] = profile["last_curiosity"] = now
+                else:
+                    profile["offered"][idea["id"]] = now
             self.changed()
             if not line or line.upper() == "WAIT":
                 return
@@ -385,6 +430,8 @@ class DailyRoutine(Star):
             suffix = "；截至" + row["date_to"] if row.get("date_to") else ""
             lines.append(f"[{row['key']}] {row['text']}（{row['start']}–{row['end']}{suffix}）")
         lines.extend(f"[{r['key']}] {r['text']}" for r in profile["facts"].values())
+        if profile.get("curiosity"):
+            lines.append("可选好奇：" + profile["curiosity"]["text"])
         lines.append("待后台整理：" + str(len(profile["pending"])) + " 条")
         if self.last_error:
             lines.append("最近后台状态：" + self.last_error)
@@ -409,6 +456,7 @@ class DailyRoutine(Star):
             _, profile = await self.command_profile(event)
             profile["generation"] += 1
             profile["pending"] = []
+            profile["curiosity"] = None
             profile["routines"] = {k: v for k, v in profile["routines"].items() if v["kind"] != kind}
             day_label = {"workday": "工作日", "restday": "休息日", "any": "每天"}.get(days, "指定星期 " + days)
             profile["routines"]["manual_" + kind] = {"key": "manual_" + kind, "kind": kind, "start": start, "end": end,
@@ -429,6 +477,8 @@ class DailyRoutine(Star):
             return
         for field in ("routines", "facts"):
             profile[field].pop(key, None)
+        profile["curiosity"] = None
+        profile["recent"] = []
         profile["generation"] += 1
         profile["pending"] = []
         self.changed()
@@ -463,7 +513,7 @@ class DailyRoutine(Star):
         _, profile = await self.command_profile(event)
         profile["contact"] = mode == "on"
         self.changed()
-        yield event.plain_result("已关闭自己的日常主动问候。" if mode == "off" else "已允许日常主动问候；仍需配置中开启并选择此私聊。")
+        yield event.plain_result("已关闭自己的日常主动联系（问候与好奇）。" if mode == "off" else "已允许日常主动联系；仍需配置中开启并选择此私聊。")
 
     async def terminate(self):
         self.closing = True

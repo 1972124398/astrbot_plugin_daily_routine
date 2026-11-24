@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +38,8 @@ class Interop(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_v1_peers_discover_and_remove_daily_context(self):
         event = Event()
-        self.plugin.identity(event)
+        _, profile = self.plugin.identity(event)
+        profile["routines"]["all_day"] = record("work", "00:00", "00:00", updated=time.time())
         for role in ("play_together", "self_amusement", "short_term_mood", "codex_bridge"):
             module, peer = self.install(role)
             self.plugin.link.connect()

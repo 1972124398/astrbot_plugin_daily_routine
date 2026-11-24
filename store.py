@@ -14,7 +14,8 @@ def new_profile(origin, persona, sender, name):
     return {"origin": origin, "persona": persona, "sender": str(sender), "name": name,
             "routines": {}, "facts": {}, "pending": [], "offered": {}, "paused": False,
             "contact": True, "last_human": 0, "last_sent": 0, "last_outbound": 0,
-            "last_checked": 0, "generation": 0, "failures": 0, "retry_at": 0}
+            "last_checked": 0, "generation": 0, "failures": 0, "retry_at": 0,
+            "recent": [], "curiosity": None, "last_curiosity": 0}
 
 
 class Store:

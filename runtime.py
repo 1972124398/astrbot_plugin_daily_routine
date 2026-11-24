@@ -49,11 +49,25 @@ class Runtime:
             try:
                 # Only a small amount of actual dialogue is needed for continuity.
                 from .routine import text
-                for item in json.loads(conversation.history)[-6:]:
-                    if item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str):
-                        history.append({"role": item["role"], "content": text(item["content"], 1000)})
+                in_task = False
+                for item in json.loads(conversation.history):
+                    if not isinstance(item, dict):
+                        continue
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        content = "\n".join(part.get("text", "") for part in content
+                                            if isinstance(part, dict) and part.get("type") == "text" and not part.get("_no_save"))
+                    if not isinstance(content, str):
+                        continue
+                    if item.get("role") == "user":
+                        in_task = "<codex_task_event>" in content or "【Codex 桥接后台事件" in content
+                    if not in_task and item.get("role") in {"user", "assistant"}:
+                        history.append({"role": item["role"], "content": text(content, 1000)})
+                history = history[-6:]
             except (ValueError, TypeError):
                 pass
+        if profile.get("last_message") and profile["last_sent"] > profile["last_human"]:
+            history.append({"role": "assistant", "content": profile["last_message"]})
         provider = str(self.config.get("greeting_provider_id", "") or "")
         provider = provider or await self.context.get_current_chat_provider_id(origin)
         return SimpleNamespace(origin=origin, session=session, platform=platform, event=event,
