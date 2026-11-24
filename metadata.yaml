@@ -1,0 +1,8 @@
+name: astrbot_plugin_daily_routine
+display_name: 日常调查
+short_desc: 后台了解每个人的作息，提供可选问候和少打扰的时机建议。
+desc: 按会话、人格和个人积累日常画像。问候由人格与短期情绪决定，可选联动长期记忆、陪它玩和自娱自乐，不接管实时对话。
+version: 0.1.0
+author: W1
+repo: https://github.com/1972124398/astrbot_plugin_daily_routine
+astrbot_version: ">=4.29.4,<5"

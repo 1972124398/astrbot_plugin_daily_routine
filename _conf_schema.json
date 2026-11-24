@@ -1,0 +1,138 @@
+{
+  "enabled": {
+    "description": "启用日常调查",
+    "type": "bool",
+    "default": true,
+    "hint": ""
+  },
+  "allowed_origins": {
+    "description": "允许记录的会话",
+    "type": "list",
+    "default": [],
+    "hint": "留空允许所有启用本插件的会话。群聊中只记录实际与 AI 交流的发送者。",
+    "_special": "umo"
+  },
+  "analysis_provider_id": {
+    "description": "后台整理模型",
+    "type": "string",
+    "default": "",
+    "hint": "留空沿用会话模型；单独选择模型可减少后台与聊天争用。",
+    "_special": "select_provider"
+  },
+  "learn_idle_seconds": {
+    "description": "停聊多少秒后整理",
+    "type": "int",
+    "default": 45,
+    "hint": "也会在累计6条或等待10分钟后整理；真人对话优先。"
+  },
+  "analysis_timeout_seconds": {
+    "description": "后台模型超时秒数",
+    "type": "int",
+    "default": 60,
+    "hint": ""
+  },
+  "timezone": {
+    "description": "默认时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "IANA 时区，例如 Asia/Shanghai、America/New_York。"
+  },
+  "china_calendar": {
+    "description": "参考中国节假日与调休",
+    "type": "bool",
+    "default": true,
+    "hint": "仅日历库支持的年份有效；未知年份退回星期安排，不猜农历节日。非中国作息建议关闭。"
+  },
+  "stale_days": {
+    "description": "作息多久未确认后停止用于时机判断",
+    "type": "int",
+    "default": 120,
+    "hint": "旧记录仍能查看，不会仅凭聊天时间刷新作息。"
+  },
+  "context_enabled": {
+    "description": "在聊天中提供简短日常背景",
+    "type": "bool",
+    "default": true,
+    "hint": "只提供当前时段和一个可选问候机会，不修改系统人格。"
+  },
+  "greeting_hints": {
+    "description": "提供可选问候机会",
+    "type": "bool",
+    "default": true,
+    "hint": "早晚、上下班前后与节假日，AI 可以完全不问候。"
+  },
+  "special_dates": {
+    "description": "额外问候日子",
+    "type": "list",
+    "default": [],
+    "hint": "每项写 MM-DD=名称 或 YYYY-MM-DD=名称，例如 12-25=圣诞节。用于所有允许会话。"
+  },
+  "proactive_enabled": {
+    "description": "允许后台私聊主动问候",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后仍需选择目标私聊；按人格与短期情绪决定是否说话，无回复不连发。"
+  },
+  "proactive_origins": {
+    "description": "主动问候目标私聊",
+    "type": "list",
+    "default": [],
+    "hint": "仅支持已有真实交流的私聊；不支持群聊群发。",
+    "_special": "umo"
+  },
+  "greeting_provider_id": {
+    "description": "主动问候模型",
+    "type": "string",
+    "default": "",
+    "hint": "留空沿用会话聊天模型。",
+    "_special": "select_provider"
+  },
+  "greeting_gap_hours": {
+    "description": "日常主动问候最小间隔（小时）",
+    "type": "int",
+    "default": 8,
+    "hint": ""
+  },
+  "interop_enabled": {
+    "description": "与其他拟人插件联动",
+    "type": "bool",
+    "default": true,
+    "hint": "未安装的插件自动略过，关闭后可独立运行。"
+  },
+  "interop_gap_minutes": {
+    "description": "与其他插件主动开口至少间隔几分钟",
+    "type": "int",
+    "default": 10,
+    "hint": ""
+  },
+  "link_self_cognition": {
+    "description": "联动自主认知（长期记忆）",
+    "type": "bool",
+    "default": true,
+    "hint": ""
+  },
+  "link_short_term_mood": {
+    "description": "联动短期共享情绪",
+    "type": "bool",
+    "default": true,
+    "hint": ""
+  },
+  "link_play_together": {
+    "description": "联动陪它玩",
+    "type": "bool",
+    "default": true,
+    "hint": ""
+  },
+  "link_self_amusement": {
+    "description": "联动自娱自乐",
+    "type": "bool",
+    "default": true,
+    "hint": ""
+  },
+  "link_codex_bridge": {
+    "description": "联动Codex Bridge",
+    "type": "bool",
+    "default": true,
+    "hint": ""
+  }
+}

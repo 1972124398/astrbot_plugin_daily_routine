@@ -1,0 +1,476 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import json
+import re
+import time
+import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.agent.message import TextPart
+
+from .interop import CompanionLink
+from .routine import (EXTRACT_SYSTEM, GREETING_SYSTEM, GUIDANCE, KINDS, LABELS, advice, apply_updates,
+                      conversation_key, human_event, minute, opportunities, parse_updates, profile_key, text)
+from .runtime import Runtime
+from .store import Store, empty_state, new_profile
+
+NAME = "astrbot_plugin_daily_routine"
+TURN = NAME + ".turn"
+
+
+class DailyRoutine(Star):
+    """后台了解每个人的日常，提供时机建议，让人格和情绪决定怎样相处。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self.store = Store(StarTools.get_data_dir(NAME))
+        self.state = empty_state()
+        self.link = CompanionLink(context, config)
+        self.runtime = Runtime(context, config, self.link)
+        self.closing = self.sending = False
+        self.worker = self.writer = self.scheduler = self.analysis_task = self.greeting_task = None
+        self.save_wake, self.wake = asyncio.Event(), asyncio.Event()
+        self.save_lock = asyncio.Lock()
+        self.frontend = {}
+        self.last_front = 0
+        self.analysis_provider = ""
+        self.chat_providers = {}
+        self.last_error = ""
+
+    async def initialize(self):
+        # Startup is the only read; every request thereafter uses memory.
+        self.state = await asyncio.to_thread(self.store.load)
+        self.link.connect()
+        self.writer = asyncio.create_task(self.run_saves(), name="daily-routine-save")
+        self.worker = asyncio.create_task(self.run(), name="daily-routine-learn")
+        self.scheduler = asyncio.create_task(self.greetings(), name="daily-routine-greet")
+
+    def changed(self):
+        self.save_wake.set()
+        self.wake.set()
+
+    async def persist(self):
+        async with self.save_lock:
+            task = asyncio.create_task(asyncio.to_thread(self.store.save, copy.deepcopy(self.state)))
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
+    async def run_saves(self):
+        while not self.closing:
+            await self.save_wake.wait()
+            self.save_wake.clear()
+            await asyncio.sleep(0.2)
+            try:
+                await self.persist()
+            except Exception as error:
+                self.last_error = str(error)[:200]
+                logger.warning("日常调查保存失败：%s", error)
+                self.save_wake.set()
+                await asyncio.sleep(5)
+
+    def allowed(self, origin):
+        if self.closing or not self.config.get("enabled", True):
+            return False
+        origins = self.config.get("allowed_origins", [])
+        if origins and origin not in origins and conversation_key(origin) not in origins:
+            return False
+        try:
+            enabled = self.context.get_config(umo=origin).get("plugin_set", ["*"])
+            return any(key in enabled for key in ("*", NAME, getattr(self, "plugin_id", "")))
+        except Exception:
+            return False
+
+    def identity(self, event):
+        origin, sender = str(event.unified_msg_origin), str(event.get_sender_id() or "")
+        persona = str(event.get_extra("_trace_persona_id") or "default")
+        key = profile_key(origin, persona, sender)
+        profile = self.state["profiles"].setdefault(key, new_profile(origin, persona, sender, text(event.get_sender_name(), 100) or sender))
+        profile["origin"] = origin
+        profile["name"] = text(event.get_sender_name(), 100) or sender
+        return key, profile
+
+    async def command_profile(self, event):
+        if event.get_extra("_trace_persona_id") is None:
+            origin = str(event.unified_msg_origin)
+            manager = self.context.conversation_manager
+            cid = await manager.get_curr_conversation_id(origin)
+            conversation = await manager.get_conversation(origin, cid) if cid else None
+            persona, _, _, _ = await self.context.persona_manager.resolve_selected_persona(
+                umo=origin, conversation_persona_id=getattr(conversation, "persona_id", None),
+                platform_name=event.get_platform_name(), provider_settings=self.context.get_config(umo=origin).get("provider_settings", {}),
+            )
+            event.set_extra("_trace_persona_id", persona)
+        return self.identity(event)
+
+    def busy(self):
+        now = time.monotonic()
+        self.frontend = {key: until for key, until in self.frontend.items() if until > now}
+        return bool(self.frontend) or now - self.last_front < 3
+
+    def selected(self, origin, persona=None, sender=None):
+        return [p for p in self.state["profiles"].values()
+                if conversation_key(p["origin"]) == conversation_key(origin) and not p["paused"]
+                and (persona is None or p["persona"] == persona) and (sender is None or p["sender"] == str(sender))]
+
+    @filter.on_llm_request(priority=-60)
+    async def prepare(self, event: AstrMessageEvent, request: ProviderRequest):
+        origin = str(event.unified_msg_origin)
+        if not self.allowed(origin) or not human_event(event) or event.get_extra(TURN):
+            return
+        human = text(event.get_message_str(), 6000)
+        if not human or human.startswith("/") or not event.get_sender_id():
+            return
+        key, profile = self.identity(event)
+        if profile["paused"]:
+            return
+        now = time.time()
+        mid = str(getattr(event.message_obj, "message_id", "") or uuid.uuid4().hex)
+        event.set_extra(TURN, {"key": key, "generation": profile["generation"]})
+        self.frontend[key + mid] = time.monotonic() + 300
+        event.get_extra(TURN)["token"] = key + mid
+        self.last_front = time.monotonic()
+        self.link.begin(event)
+        configured = str(self.config.get("analysis_provider_id", "") or "")
+        if self.analysis_task and not self.analysis_task.done():
+            if not configured or self.chat_providers.get(origin) in {None, configured}:
+                self.analysis_task.cancel()
+        if self.greeting_task and not self.greeting_task.done() and not self.sending:
+            self.greeting_task.cancel()
+        previous_greeting = profile.get("last_message", "") if profile["last_sent"] > profile["last_human"] else ""
+        profile["last_human"] = now
+        profile["offered"] = {k: v for k, v in profile["offered"].items() if now - v < 3 * 86400}
+        if not any(t["id"] == mid for t in profile["pending"]):
+            profile["pending"].append({"id": mid, "text": human, "time": now})
+        self.changed()
+        if not self.config.get("context_enabled", True):
+            return
+        timing = advice(profile, now, self.config)
+        ideas = opportunities(profile, now, self.config) if self.config.get("greeting_hints", True) else []
+        # One short current-state hint; do not inject an entire portrait every turn.
+        lines = timing["current"][:2]
+        if re.search(r"作息|几点|上班|下班|睡觉|起床|午休|通勤|日程|有空|空闲|习惯|放假|加班", human):
+            remembered = [r["text"] for field in ("routines", "facts") for r in profile[field].values()]
+            if remembered:
+                lines.append("日常话题相关的旧记录（可能需要更新）：" + "；".join(remembered[:6])[:700])
+        if previous_greeting:
+            lines.append("上次主动说过，供接住这次回应：" + previous_greeting)
+        if ideas:
+            idea = ideas[0]
+            lines.append("可选时机：" + idea["label"] + "（" + idea["context"] + "）")
+            event.get_extra(TURN)["offered"] = idea["id"]
+        if not lines:
+            return
+        payload = "<daily_routine>\n" + GUIDANCE + "\n" + "\n".join(lines) + "\n</daily_routine>"
+        parts = request.extra_user_content_parts
+        if parts is None:
+            parts = request.extra_user_content_parts = []
+        if not any(str(getattr(p, "text", "")).startswith("<daily_routine>") for p in parts):
+            parts.append(TextPart(text=payload).mark_as_temp())
+
+    @filter.on_llm_response(priority=-100)
+    async def response(self, event: AstrMessageEvent, response):
+        turn = event.get_extra(TURN)
+        if not turn or getattr(response, "tools_call_args", None):
+            return
+        self.frontend.pop(turn["token"], None)
+        self.last_front = time.monotonic()
+        self.link.end(event)
+        profile = self.state["profiles"].get(turn["key"])
+        if profile and profile["generation"] == turn["generation"] and turn.get("offered"):
+            # Offered means considered, not a claim that the AI actually greeted.
+            profile["offered"][turn["offered"]] = time.time()
+            self.changed()
+
+    @filter.on_agent_done(priority=-100)
+    async def agent_done(self, event: AstrMessageEvent, run_context, response):
+        await self.response(event, response)
+
+    async def process(self, key, profile):
+        turns = copy.deepcopy(profile["pending"][:16])
+        generation = profile["generation"]
+        zone = ZoneInfo(profile.get("timezone") or self.config.get("timezone", "Asia/Shanghai"))
+        provider = str(self.config.get("analysis_provider_id", "") or "")
+        self.chat_providers[profile["origin"]] = await self.context.get_current_chat_provider_id(profile["origin"])
+        self.analysis_provider = provider or self.chat_providers[profile["origin"]]
+        payload = {"person": profile["name"], "timezone": str(zone),
+                   "turns": [{**t, "at": datetime.fromtimestamp(t["time"], zone).isoformat()} for t in turns],
+                   "known": {field: list(profile[field].values()) for field in ("routines", "facts")},
+                   "long_term_memory": self.link.snapshot("self_cognition", profile["origin"], persona=profile["persona"])}
+        async with asyncio.timeout(float(self.config.get("analysis_timeout_seconds", 60))):
+            response = await self.context.llm_generate(chat_provider_id=self.analysis_provider, system_prompt=EXTRACT_SYSTEM,
+                                                       prompt=json.dumps(payload, ensure_ascii=False))
+        updates = parse_updates(response.completion_text, turns)
+        if (self.state["profiles"].get(key) is not profile or profile["generation"] != generation
+                or profile["paused"] or not self.allowed(profile["origin"])):
+            return
+        apply_updates(profile, updates, time.time())
+        ids = {t["id"] for t in turns}
+        profile["pending"] = [t for t in profile["pending"] if t["id"] not in ids]
+        profile["failures"], profile["retry_at"] = 0, 0
+        self.last_error = ""
+        self.changed()
+
+    async def run(self):
+        while not self.closing:
+            self.wake.clear()
+            self.link.connect()
+            now = time.time()
+            if not self.busy():
+                for key, profile in list(self.state["profiles"].items()):
+                    turns = profile["pending"]
+                    if not turns or profile["paused"] or not self.allowed(profile["origin"]) or now < profile["retry_at"]:
+                        continue
+                    if (now - turns[-1]["time"] < float(self.config.get("learn_idle_seconds", 45))
+                            and len(turns) < 6 and now - turns[0]["time"] < 600):
+                        continue
+                    try:
+                        self.analysis_task = asyncio.create_task(self.process(key, profile))
+                        await self.analysis_task
+                    except asyncio.CancelledError:
+                        if self.closing:
+                            raise
+                    except Exception as error:
+                        profile["failures"] += 1
+                        profile["retry_at"] = now + min(3600, 30 * 2 ** min(profile["failures"], 7))
+                        self.last_error = str(error)[:200]
+                        logger.warning("日常调查后台整理稍后重试：%s", error)
+                        self.changed()
+                    finally:
+                        self.analysis_task = None
+                    break
+            try:
+                await asyncio.wait_for(self.wake.wait(), 5)
+            except TimeoutError:
+                pass
+
+    def companion_snapshot(self, origin=""):
+        if not origin or not self.allowed(origin) or not self.config.get("interop_enabled", True):
+            return {}
+        profiles = self.selected(origin)
+        if not profiles or len({p["persona"] for p in profiles}) != 1:
+            return {}
+        now = time.time()
+        people = [{"name": p["name"], "sender_id": p["sender"], **advice(p, now, self.config),
+                   "greeting_opportunities": opportunities(p, now, self.config)[:1] if self.config.get("greeting_hints", True) else []}
+                  for p in profiles[:8]]
+        return {"guidance": GUIDANCE, "people": people}
+
+    def companion_timing(self, origin, *, role="", sender="", persona=None):
+        if not self.config.get("interop_enabled", True) or not self.allowed(origin):
+            return {}
+        if role and not self.link.peer(role, origin):
+            return {}
+        # No group-wide suppression based on one person's work schedule.
+        if ":GroupMessage:" in origin and not sender:
+            return {}
+        profiles = self.selected(origin, persona, sender or None)
+        return advice(profiles[0], time.time(), self.config) if len(profiles) == 1 else {}
+
+    def companion_allow_initiative(self, origin, role):
+        timing = self.companion_timing(origin, role=role)
+        return self.timing_choice(origin, role, timing.get("initiative_factor", 1.0))
+
+    @staticmethod
+    def timing_choice(origin, role, factor):
+        # Keep the choice stable for half an hour so frequent schedulers cannot
+        # repeatedly reroll a busy user's small chance until it becomes certain.
+        bucket = f"{conversation_key(origin)}:{role}:{int(time.time() // 1800)}"
+        draw = int.from_bytes(hashlib.sha256(bucket.encode()).digest()[:8], "big") / 2**64
+        return draw < factor
+
+    def companion_observe(self, packet):
+        role, origin = packet.get("source"), packet.get("origin", "")
+        if not self.allowed(origin) or not self.link.peer(role, origin):
+            return
+        if packet.get("kind") == "initiative":
+            now = time.time()
+            # Other plugins' speech is not a new human routine observation.
+            for profile in self.selected(origin):
+                profile["last_outbound"] = now
+            self.changed()
+
+    async def greet(self, profile):
+        origin, now = profile["origin"], time.time()
+        if (not self.allowed(origin) or not self.config.get("proactive_enabled", False)
+                or origin not in self.config.get("proactive_origins", []) or ":FriendMessage:" not in origin
+                or profile["paused"] or not profile["contact"] or self.busy()):
+            return
+        if (not profile["last_human"] or now - profile["last_human"] > 7 * 86400
+                or now - profile["last_human"] < 300 or profile["last_outbound"] > profile["last_human"]
+                or now - profile["last_sent"] < float(self.config.get("greeting_gap_hours", 8)) * 3600
+                or now - profile["last_checked"] < 1800):
+            return
+        ideas = opportunities(profile, now, self.config)
+        timing = advice(profile, now, self.config)
+        if not ideas or not self.timing_choice(origin, "daily_routine", timing["initiative_factor"]):
+            return
+        if self.link.snapshot("play_together", origin).get("current_game") or self.link.snapshot("self_amusement", origin).get("wants_space"):
+            return
+        if not await self.runtime.enabled(origin):
+            return
+        token = self.link.claim(float(self.config.get("interop_gap_minutes", 10)) * 60)
+        if not token:
+            return
+        try:
+            profile["last_checked"] = now
+            self.changed()
+            generation = profile["generation"]
+            async with asyncio.timeout(float(self.config.get("analysis_timeout_seconds", 60))):
+                view = await self.runtime.view(profile)
+                if view.persona_id != profile["persona"]:
+                    return
+                payload = {"opportunities": ideas, "routine": timing,
+                           "long_term_memory": self.link.snapshot("self_cognition", origin, persona=profile["persona"]),
+                           "mood": self.link.snapshot("short_term_mood", origin)}
+                line = await self.runtime.draft(view, GREETING_SYSTEM, payload)
+            if (not self.link.current(token) or generation != profile["generation"] or not self.allowed(origin)
+                    or not self.config.get("proactive_enabled", False) or not profile["contact"] or profile["paused"]
+                    or origin not in self.config.get("proactive_origins", [])):
+                return
+            for idea in ideas:
+                profile["offered"][idea["id"]] = now
+            self.changed()
+            if not line or line.upper() == "WAIT":
+                return
+            self.sending = True
+            # Persist the attempt before sending; an unconfirmed send must not be retried in a loop.
+            profile["last_outbound"] = time.time()
+            await self.persist()
+            async with asyncio.timeout(30):
+                delivered = await self.runtime.send(view, line[:1000])
+            if delivered:
+                profile["last_sent"] = time.time()
+                profile["last_message"] = line[:1000]
+                self.link.sent(origin, line[:1000], view.persona)
+            self.changed()
+        finally:
+            self.sending = False
+            self.link.release(token)
+
+    async def greetings(self):
+        while not self.closing:
+            for profile in list(self.state["profiles"].values()):
+                try:
+                    self.greeting_task = asyncio.create_task(self.greet(profile))
+                    await self.greeting_task
+                except asyncio.CancelledError:
+                    if self.closing:
+                        raise
+                except Exception as error:
+                    self.last_error = str(error)[:200]
+                    logger.warning("日常调查这次先不问候：%s", error)
+                finally:
+                    self.greeting_task = None
+            await asyncio.sleep(60)
+
+    @filter.command("routine", alias={"日常调查"})
+    async def status(self, event: AstrMessageEvent):
+        if not self.allowed(str(event.unified_msg_origin)):
+            return
+        _, profile = await self.command_profile(event)
+        lines = [f"{profile['name']}的日常画像（当前会话与人格）", "记录：" + ("暂停" if profile["paused"] else "开启")]
+        for row in profile["routines"].values():
+            suffix = "；截至" + row["date_to"] if row.get("date_to") else ""
+            lines.append(f"[{row['key']}] {row['text']}（{row['start']}–{row['end']}{suffix}）")
+        lines.extend(f"[{r['key']}] {r['text']}" for r in profile["facts"].values())
+        lines.append("待后台整理：" + str(len(profile["pending"])) + " 条")
+        if self.last_error:
+            lines.append("最近后台状态：" + self.last_error)
+        lines.append("修正可直接聊天；/routine_set 手动设置；/routine_forget key 删除；/routine_control pause/resume/clear；/routine_contact off/on。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("routine_set")
+    async def set_routine(self, event: AstrMessageEvent, kind: str = "", start: str = "", end: str = "", days: str = "workday"):
+        if not self.allowed(str(event.unified_msg_origin)):
+            return
+        try:
+            if kind not in KINDS:
+                raise ValueError("kind 可选 work/sleep/meal/commute/free/busy/other")
+            minute(start)
+            minute(end)
+            if days in {"any", "workday", "restday"}:
+                weekdays, day_type = list(range(7)), days
+            else:
+                weekdays, day_type = [int(d) for d in days.split(",")], "any"
+                if not weekdays or any(not 0 <= d <= 6 for d in weekdays):
+                    raise ValueError("周几使用 0–6，逗号分隔，0 是周一")
+            _, profile = await self.command_profile(event)
+            profile["generation"] += 1
+            profile["pending"] = []
+            profile["routines"] = {k: v for k, v in profile["routines"].items() if v["kind"] != kind}
+            day_label = {"workday": "工作日", "restday": "休息日", "any": "每天"}.get(days, "指定星期 " + days)
+            profile["routines"]["manual_" + kind] = {"key": "manual_" + kind, "kind": kind, "start": start, "end": end,
+                "days": weekdays, "day_type": day_type, "text": f"{day_label} {start}–{end} {LABELS[kind]}",
+                "evidence": "本人手动设置", "source_id": "manual", "updated": time.time()}
+            self.changed()
+            yield event.plain_result("已记下，可用 /routine 查看。")
+        except ValueError as error:
+            yield event.plain_result(f"{error}。示例：/routine_set work 09:00 18:00 workday；夜班 /routine_set work 22:00 06:00 0,1,2,3,4")
+
+    @filter.command("routine_forget")
+    async def forget(self, event: AstrMessageEvent, key: str = ""):
+        if not self.allowed(str(event.unified_msg_origin)):
+            return
+        _, profile = await self.command_profile(event)
+        if not key:
+            yield event.plain_result("先用 /routine 查看条目前的 key，再用 /routine_forget key 删除。")
+            return
+        for field in ("routines", "facts"):
+            profile[field].pop(key, None)
+        profile["generation"] += 1
+        profile["pending"] = []
+        self.changed()
+        yield event.plain_result("已删除该条并放下待整理片段，之后只从新的聊天重新了解。")
+
+    @filter.command("routine_control")
+    async def control(self, event: AstrMessageEvent, action: str = ""):
+        if not self.allowed(str(event.unified_msg_origin)):
+            return
+        key, profile = await self.command_profile(event)
+        if action in {"pause", "resume"}:
+            profile["paused"] = action == "pause"
+            profile["generation"] += 1
+        elif action == "clear":
+            profile["generation"] += 1
+            replacement = new_profile(profile["origin"], profile["persona"], profile["sender"], profile["name"])
+            replacement.update(generation=profile["generation"], contact=profile["contact"])
+            self.state["profiles"][key] = replacement
+        else:
+            yield event.plain_result("/routine_control pause 暂停；resume 恢复；clear 清空自己的当前会话人格画像。")
+            return
+        self.changed()
+        yield event.plain_result("已更新当前个人画像。")
+
+    @filter.command("routine_contact")
+    async def contact(self, event: AstrMessageEvent, mode: str = "off"):
+        if not self.allowed(str(event.unified_msg_origin)):
+            return
+        if mode not in {"off", "on"}:
+            yield event.plain_result("使用 /routine_contact off 或 on。")
+            return
+        _, profile = await self.command_profile(event)
+        profile["contact"] = mode == "on"
+        self.changed()
+        yield event.plain_result("已关闭自己的日常主动问候。" if mode == "off" else "已允许日常主动问候；仍需配置中开启并选择此私聊。")
+
+    async def terminate(self):
+        self.closing = True
+        tasks = [t for t in (self.worker, self.writer, self.scheduler, self.analysis_task, self.greeting_task) if t]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.persist()
+        self.link.close()
