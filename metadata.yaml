@@ -2,7 +2,7 @@ name: astrbot_plugin_daily_routine
 display_name: 日常调查
 short_desc: 后台记住每个人的日常，按话题回想，留一点自然好奇。
 desc: 日常专用长期记忆与可选好奇，积累作息、习惯和近况，只在相关时提供简短背景。表达由人格与短期情绪决定，可选联动长期记忆、陪它玩和自娱自乐。
-version: 0.3.0
+version: 0.3.1
 author: W1
 repo: https://github.com/1972124398/astrbot_plugin_daily_routine
 astrbot_version: ">=4.29.4,<5"

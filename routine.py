@@ -283,11 +283,24 @@ def available_records(profile, now, stale_days):
 def effective_records(records, moment, china):
     """Dated shifts replace their own kind for the day, not unrelated sleep."""
     base = [r for r in records if not (r.get("date_from") or r.get("date_to"))]
-    dated = [r for r in records if (r.get("date_from") or r.get("date_to"))
-             and not any(b.get("kind") == r.get("kind") and b.get("updated", 0) > r.get("updated", 0) for b in base)
-             and (valid_on(r, moment.date(), china) or active(r, moment, china))]
+    dated = []
+    anchors = {}
+    for row in records:
+        if not (row.get("date_from") or row.get("date_to")):
+            continue
+        anchor = moment.date()
+        if active(row, moment, china) and minute(row["start"]) > minute(row["end"]) and moment.hour * 60 + moment.minute < minute(row["end"]):
+            anchor -= timedelta(days=1)
+        if not valid_on(row, anchor, china):
+            continue
+        if any(b.get("key") == row.get("key") and b.get("kind") == row.get("kind")
+               and valid_on(b, anchor, china) and b.get("updated", 0) > row.get("updated", 0) for b in base):
+            continue
+        dated.append(row)
+        anchors[id(row)] = anchor
     return [*dated, *(r for r in base if not any(
-        (r.get("kind") == d.get("kind") or (d.get("kind") == "free" and active(d, moment, china) and r.get("kind") in {"work", "busy"}))
+        ((r.get("kind") == d.get("kind") and valid_on(r, anchors[id(d)], china))
+         or (d.get("kind") == "free" and active(d, moment, china) and r.get("kind") in {"work", "busy"}))
         for d in dated))]
 
 

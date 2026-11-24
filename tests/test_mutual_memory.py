@@ -182,3 +182,74 @@ class MutualMemory(unittest.IsolatedAsyncioTestCase):
         self.daily.config['context_enabled'] = False
         self.assertFalse(self.cog.memory.recall(self.scope, self.actor, '喝茶', conversation=True)['memories'])
         self.assertTrue(self.cog.memory.recall(self.scope, self.actor, '喝茶')['memories'])
+
+    async def learn_shift(self):
+        self.now = stamp('2026-11-24T15:00')
+        await self.native_cognition(updated=self.now - 100)
+        self.daily.sync_memory(self.profile)
+        source = self.profile['shared_pending']['records'][0]
+        self.context.llm_generate.return_value.completion_text = json.dumps({'routines': [{
+            **record(text=source['text']), 'source_id': 'cognition:' + source['key'], 'evidence': source['text']}]})
+        await self.daily.process(self.key, self.profile)
+
+    async def test_unrelated_source_change_preserves_unchanged_learned_shift(self):
+        await self.learn_shift()
+        await self.native_cognition(content='喜欢悬疑电影', updated=self.now)
+        self.daily.sync_memory(self.profile)
+        self.assertEqual(advice(self.daily.memory_profile(self.profile), self.now, {'china_calendar': False})['initiative_factor'], .15)
+        # A model may correctly return no changes for already known knowledge.
+        self.context.llm_generate.return_value.completion_text = '{"routines":[],"facts":[],"remove":[]}'
+        await self.daily.process(self.key, self.profile)
+        self.assertEqual(advice(self.daily.memory_profile(self.profile), self.now, {'china_calendar': False})['initiative_factor'], .15)
+
+    async def test_explicit_user_removal_blocks_imported_shift(self):
+        await self.learn_shift()
+        self.profile['pending'] = [{'id': 'correction', 'text': '已经离职，不再按这个班次上班', 'time': self.now}]
+        self.context.llm_generate.return_value.completion_text = json.dumps({'remove': [
+            {'key': 'work', 'source_id': 'correction', 'evidence': '不再按这个班次上班'}]})
+        await self.daily.process(self.key, self.profile)
+        self.assertEqual(advice(self.daily.memory_profile(self.profile), self.now, {'china_calendar': False})['initiative_factor'], 1)
+        await self.native_cognition(content='晚饭吃面条', updated=self.now)
+        self.daily.sync_memory(self.profile)
+        self.assertFalse(any(r['text'] == '平时九点到六点上班' for r in self.profile['shared_pending']['records']))
+
+    async def test_manual_night_shift_replaces_old_imported_day_shift(self):
+        await self.learn_shift()
+        _ = [r async for r in self.daily.set_routine(self.event, 'work', '22:00', '06:00', 'any')]
+        self.assertEqual(advice(self.daily.memory_profile(self.profile), self.now, {'china_calendar': False})['initiative_factor'], 1)
+        self.assertEqual(advice(self.daily.memory_profile(self.profile), stamp('2026-11-24T23:00'), {'china_calendar': False})['initiative_factor'], .15)
+        self.daily.sync_memory(self.profile)
+        self.assertNotIn('work', self.profile['learned']['routines'])
+
+    async def test_changed_or_deleted_source_record_is_removed_without_dropping_other_records(self):
+        await self.learn_shift()
+        self.profile['learned']['facts']['tea'] = {'key': 'tea', 'text': '喜欢喝茶', 'updated': self.now - 200, 'source_id': 'cognition:other'}
+        self.profile['shared_source'].append({'key': 'other', 'text': '喜欢喝茶', 'updated': self.now - 200})
+        # Only the actual original shift remains in the authoritative source.
+        await self.native_cognition(content='喜欢悬疑电影', updated=self.now)
+        self.daily.sync_memory(self.profile)
+        self.assertIn('work', self.profile['learned']['routines'])
+        self.assertNotIn('tea', self.profile['learned']['facts'])
+
+    async def test_correction_during_import_does_not_reinsert_the_same_source_result(self):
+        self.now = stamp('2026-11-24T15:00')
+        await self.native_cognition(updated=self.now - 100)
+        self.daily.sync_memory(self.profile)
+        source = self.profile['shared_pending']['records'][0]
+        self.profile['pending'] = [{'id': 'correction', 'text': '不再按这个班次上班', 'time': self.now}]
+        self.context.llm_generate.return_value.completion_text = json.dumps({
+            'routines': [{**record(text=source['text']), 'source_id': 'cognition:' + source['key'], 'evidence': source['text']}],
+            'remove': [{'key': 'work', 'source_id': 'correction', 'evidence': '不再按这个班次上班'}]})
+        await self.daily.process(self.key, self.profile)
+        self.assertFalse(self.profile['learned']['routines'])
+
+    async def test_manual_override_survives_reload_and_unrelated_source_update(self):
+        await self.learn_shift()
+        _ = [r async for r in self.daily.set_routine(self.event, 'work', '22:00', '06:00', 'any')]
+        await self.daily.persist()
+        self.daily.state = self.daily.store.load()
+        self.profile = self.daily.state['profiles'][self.key]
+        await self.native_cognition(content='喜欢悬疑电影', updated=self.now)
+        self.daily.sync_memory(self.profile)
+        self.assertEqual([r['text'] for r in self.profile['shared_pending']['records']], ['喜欢悬疑电影'])
+        self.assertEqual(advice(self.daily.memory_profile(self.profile), self.now, {'china_calendar': False})['initiative_factor'], 1)

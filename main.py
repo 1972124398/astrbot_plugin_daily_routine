@@ -279,15 +279,24 @@ class DailyRoutine(Star):
         if "curiosity" in updates:
             native["curiosity"] = updates["curiosity"]
         apply_updates(profile, native, time.time())
+        removed = {r["key"] for r in native["remove"]}
+        self.suppress_learned(profile, keys=removed, source_ids={r["source_id"] for field in ("routines", "facts")
+            for r in updates[field] if r["key"] in removed and r["source_id"] not in native_ids})
         if native.get("curiosity") and native["curiosity"]["source_id"] not in native_ids:
             profile["curiosity"]["updated"] = next(t["time"] for t in imported if t["id"] == native["curiosity"]["source_id"])
         if shared is not None and profile.get("shared_pending") is shared:
-            learned = {"routines": {}, "facts": {}, "exceptions": {}}
+            learned = copy.deepcopy(profile.get("learned", {"routines": {}, "facts": {}, "exceptions": {}}))
             originals = {t["id"]: t for t in imported}
+            source_rows = {"cognition:" + str(r["key"]): r for r in shared["records"]}
+            blocked = set(profile.get("shared_blocked", []))
+            for row in updates["remove"]:
+                if row["source_id"] in originals:
+                    for field in ("routines", "facts", "exceptions"):
+                        learned[field] = {k: r for k, r in learned.get(field, {}).items() if r["key"] != row["key"]}
             for field in ("routines", "facts"):
                 for row in updates[field]:
                     original = originals.get(row["source_id"])
-                    if original:
+                    if original and self.shared_fingerprint(source_rows[row["source_id"]]) not in blocked:
                         row = {**row, "learned_from": "self_cognition", "original_evidence": original["original_evidence"]}
                         apply_updates(learned, {"routines": [row] if field == "routines" else [],
                                                "facts": [row] if field == "facts" else [], "remove": []}, original["time"])
@@ -368,6 +377,20 @@ class DailyRoutine(Star):
             return {}
         return self.link.snapshot("self_cognition", profile["origin"], persona=profile["persona"])
 
+    def suppress_learned(self, profile, *, keys=(), kind="", source_ids=()):
+        """A direct correction wins over the imported records it replaces."""
+        sources = set(source_ids)
+        learned = profile.get("learned", {})
+        for field in ("routines", "facts", "exceptions"):
+            for slot, row in list(learned.get(field, {}).items()):
+                if row["key"] in keys or (kind and row.get("kind") == kind):
+                    sources.add(row.get("source_id", ""))
+                    learned[field].pop(slot)
+        blocked = set(profile.get("shared_blocked", []))
+        blocked.update(self.shared_fingerprint(r) for r in profile.get("shared_source", [])
+                       if "cognition:" + str(r["key"]) in sources)
+        profile["shared_blocked"] = sorted(blocked)
+
     def sync_memory(self, profile):
         if profile["paused"] or not self.allowed(profile["origin"]):
             return
@@ -387,10 +410,17 @@ class DailyRoutine(Star):
         revision = hashlib.sha256(json.dumps(data.get("records", []), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         if revision == profile.get("shared_revision") or revision == profile.get("shared_pending", {}).get("revision"):
             return
+        old_sources = {"cognition:" + str(r["key"]): self.shared_fingerprint(r)
+                       for r in profile.get("shared_source", [])}
         profile["shared_source"] = data.get("records", [])
         blocked = set(profile.get("shared_blocked", []))
         records = [row for row in data.get("records", []) if self.shared_fingerprint(row) not in blocked]
-        profile["learned"] = {}
+        current_sources = {"cognition:" + str(r["key"]): self.shared_fingerprint(r) for r in records}
+        learned = profile.get("learned", {})
+        profile["learned"] = {field: {k: r for k, r in learned.get(field, {}).items()
+                                      if r.get("source_id") in current_sources
+                                      and old_sources.get(r["source_id"]) == current_sources[r["source_id"]]}
+                              for field in ("routines", "facts", "exceptions")}
         if not records:
             profile["learned"] = {}
             profile["shared_revision"] = revision
@@ -584,7 +614,9 @@ class DailyRoutine(Star):
             profile["generation"] += 1
             profile["pending"] = []
             profile["curiosity"] = None
+            self.suppress_learned(profile, kind=kind)
             profile["routines"] = {k: v for k, v in profile["routines"].items() if v["kind"] != kind}
+            profile["exceptions"] = {k: r for k, r in profile.get("exceptions", {}).items() if r.get("kind") != kind}
             day_label = {"workday": "工作日", "restday": "休息日", "any": "每天"}.get(days, "指定星期 " + days)
             profile["routines"]["manual_" + kind] = {"key": "manual_" + kind, "kind": kind, "start": start, "end": end,
                 "days": weekdays, "day_type": day_type, "text": f"{day_label} {start}–{end} {LABELS[kind]}",
@@ -605,10 +637,7 @@ class DailyRoutine(Star):
         for field in ("routines", "facts"):
             profile[field].pop(key, None)
         profile["exceptions"] = {slot: r for slot, r in profile.get("exceptions", {}).items() if r["key"] != key}
-        profile["learned"] = {}
-        profile["shared_blocked"] = list(set(profile.get("shared_blocked", [])) |
-                                          {self.shared_fingerprint(r) for r in profile.get("shared_source", [])})
-        profile.pop("shared_pending", None)
+        self.suppress_learned(profile, keys={key})
         profile["curiosity"] = None
         profile["recent"] = []
         profile["generation"] += 1

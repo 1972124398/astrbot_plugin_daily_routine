@@ -135,3 +135,14 @@ class ReviewFixes(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.p['last_outbound'], 0)
         finally:
             self.plugin.persist = old
+
+    async def test_monday_confirmation_does_not_invalidate_tuesday_dated_night_shift(self):
+        self.p['routines']['monday'] = record(days=[0], updated=self.now)
+        apply_updates(self.p, {'routines': [record(start='22:00', end='06:00', date_from='2026-11-24', date_to='2026-11-24')], 'facts': [], 'remove': []}, self.now - 100)
+        self.assertEqual(advice(self.p, stamp('2026-11-24T23:00'), {'china_calendar': False})['initiative_factor'], .15)
+        self.assertEqual(advice(self.p, stamp('2026-11-25T03:00'), {'china_calendar': False})['initiative_factor'], .15)
+
+    async def test_tuesday_future_shift_does_not_cancel_monday_shift_after_midnight(self):
+        self.p['routines']['monday'] = record(start='22:00', end='06:00', days=[0], updated=self.now - 200)
+        apply_updates(self.p, {'routines': [record(start='22:00', end='06:00', date_from='2026-11-24', date_to='2026-11-24')], 'facts': [], 'remove': []}, self.now - 100)
+        self.assertEqual(advice(self.p, stamp('2026-11-24T03:00'), {'china_calendar': False})['initiative_factor'], .15)
