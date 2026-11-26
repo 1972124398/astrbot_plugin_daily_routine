@@ -37,6 +37,7 @@ class DailyRoutine(Star):
         self.link = CompanionLink(context, config)
         self.runtime = Runtime(context, config, self.link)
         self.closing = self.sending = False
+        self.sending_profile = None
         self.worker = self.writer = self.scheduler = self.analysis_task = self.greeting_task = None
         self.save_wake, self.wake = asyncio.Event(), asyncio.Event()
         self.save_lock = asyncio.Lock()
@@ -352,6 +353,29 @@ class DailyRoutine(Star):
         # Explicit background timing and memory interfaces own these data now.
         return {}
 
+    async def companion_clear(self, origin, *, persona):
+        if not self.allowed(origin):
+            return "unavailable"
+        if self.sending_profile == (conversation_key(origin), persona):
+            return "busy"
+        for key, profile in self.state["profiles"].items():
+            if profile["persona"] == persona and conversation_key(profile["origin"]) == conversation_key(origin):
+                self.clear_profile(key, profile)
+        self.changed()
+        await self.persist()
+        return "cleared"
+
+    def clear_profile(self, key, profile):
+        profile["generation"] += 1
+        replacement = new_profile(profile["origin"], profile["persona"], profile["sender"], profile["name"])
+        replacement.update(generation=profile["generation"], contact=profile["contact"], paused=profile["paused"])
+        blocked = set(profile.get("shared_blocked", []))
+        blocked.update(self.shared_fingerprint(row) for row in profile.get("shared_source", []))
+        current = self.cognition_background(profile)
+        blocked.update(self.shared_fingerprint(row) for row in current.get("records", []))
+        replacement["shared_blocked"] = sorted(blocked)
+        self.state["profiles"][key] = replacement
+
     def memory_profile(self, profile):
         """Read-through learned records; native and imported origins stay separate."""
         if not self.link.peer("self_cognition", profile["origin"]):
@@ -482,6 +506,7 @@ class DailyRoutine(Star):
 
     async def greet(self, profile):
         origin, now = profile["origin"], time.time()
+        generation = profile["generation"]
         if (not self.allowed(origin) or not self.config.get("proactive_enabled", False)
                 or origin not in self.config.get("proactive_origins", []) or ":FriendMessage:" not in origin
                 or profile["paused"] or not profile["contact"] or profile["pending"] or "shared_pending" in profile or self.busy()):
@@ -502,7 +527,7 @@ class DailyRoutine(Star):
             return
         if self.link.snapshot("play_together", origin).get("current_game") or self.link.snapshot("self_amusement", origin).get("wants_space"):
             return
-        if not await self.runtime.enabled(origin):
+        if not await self.runtime.enabled(origin) or generation != profile["generation"]:
             return
         token = self.link.claim(float(self.config.get("interop_gap_minutes", 10)) * 60)
         if not token:
@@ -512,7 +537,6 @@ class DailyRoutine(Star):
         try:
             profile["last_checked"] = now
             self.changed()
-            generation = profile["generation"]
             async with asyncio.timeout(float(self.config.get("analysis_timeout_seconds", 60))):
                 view = await self.runtime.view(profile)
                 if view.persona_id != profile["persona"]:
@@ -545,6 +569,7 @@ class DailyRoutine(Star):
                     or (thought and not self.config.get("curiosity_enabled", True))):
                 return
             self.sending = True
+            self.sending_profile = (conversation_key(origin), profile["persona"])
             attempted = True
             async with asyncio.timeout(30):
                 delivered = await self.runtime.send(view, line[:1000])
@@ -558,6 +583,7 @@ class DailyRoutine(Star):
                 profile["last_outbound"] = previous_outbound
                 self.changed()
             self.sending = False
+            self.sending_profile = None
             self.link.release(token)
 
     async def greetings(self):
@@ -654,12 +680,7 @@ class DailyRoutine(Star):
             profile["paused"] = action == "pause"
             profile["generation"] += 1
         elif action == "clear":
-            profile["generation"] += 1
-            replacement = new_profile(profile["origin"], profile["persona"], profile["sender"], profile["name"])
-            replacement.update(generation=profile["generation"], contact=profile["contact"])
-            replacement["shared_blocked"] = list(set(profile.get("shared_blocked", [])) |
-                                                  {self.shared_fingerprint(r) for r in profile.get("shared_source", [])})
-            self.state["profiles"][key] = replacement
+            self.clear_profile(key, profile)
         else:
             yield event.plain_result("/routine_control pause 暂停；resume 恢复；clear 清空自己的当前会话人格画像。")
             return

@@ -53,6 +53,28 @@ class MutualMemory(unittest.IsolatedAsyncioTestCase):
         from astrbot_plugin_self_cognition.cognition import actor_key as other
         self.assertEqual(self.actor, other(self.origin, 'alice'))
 
+    async def test_panel_clears_daily_profile_and_both_import_paths(self):
+        await self.native_cognition()
+        self.profile['facts']['tea'] = {'key': 'tea', 'text': '喜欢喝茶', 'updated': time.time()}
+        self.profile['contact'] = False
+        state = self.cog.memory.states[self.scope]
+        await self.cog.sync_daily_memory(state)
+        self.assertTrue(self.cog.memory.views[self.scope]['daily_memory'])
+        other_event = Event()
+        other_event.set_extra('_trace_persona_id', 'other')
+        _, other = self.daily.identity(other_event)
+        other['facts']['tea'] = dict(self.profile['facts']['tea'])
+        self.assertEqual(await self.cog.clear_companion(state, 'daily_routine'), 'cleared')
+        current = self.daily.state['profiles'][self.key]
+        self.assertFalse(current['facts'])
+        self.assertFalse(current['contact'])
+        self.assertTrue(other['facts'])
+        self.assertFalse(self.cog.memory.views[self.scope]['daily_memory'])
+        self.assertTrue(self.cog.companion_memory(self.origin, persona='friend', actor=self.actor)['records'])
+        self.daily.sync_memory(current)
+        self.assertNotIn('shared_pending', current)
+        self.assertFalse(self.daily.store.load()['profiles'][self.key]['facts'])
+
     async def test_daily_memory_is_learned_and_recalled_by_cognition_without_affection_gain(self):
         now = time.time()
         self.profile['facts']['meal'] = {'key': 'meal', 'text': '早餐喜欢喝牛奶', 'evidence': '我早餐喝牛奶', 'updated': now}
